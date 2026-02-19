@@ -2,6 +2,7 @@
 # ARIYAAM v3.0 — SELECT-THEN-PREDICT RATIONALE ARCHITECTURE
 # Module: 02_select_predict.py (VS Code Compatible)
 # Target: Faithful NLI with extracted evidence rationales
+# ✅ FIXED: Uses CUSTOM dataset scripts (not HuggingFace Hub)
 # ✅ FIXED: Colab dependencies removed for local execution
 # ✅ FIXED: Windows multiprocessing guards added
 # ✅ FIXED: All paths are local/relative (no /content/)
@@ -27,7 +28,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 from tqdm import tqdm
-from datasets import Dataset, DatasetDict, Features, Sequence, Value, concatenate_datasets, load_dataset
+from datasets import Dataset, DatasetDict, Features, Sequence, Value, concatenate_datasets, load_dataset, load_from_disk
 from transformers import (
     AutoTokenizer,
     AutoModel,
@@ -67,11 +68,13 @@ class Config:
         self.base_dir = os.getcwd()
         self.output_dir = os.path.join(self.base_dir, "models")
         self.data_dir = os.path.join(self.base_dir, "data")
+        self.datasets_dir = os.path.join(self.base_dir, "datasets")  # Custom dataset scripts
         self.drive_dir = os.path.join(self.base_dir, "drive_backup")
         
         # Create directories
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.data_dir, exist_ok=True)
+        os.makedirs(self.datasets_dir, exist_ok=True)
         os.makedirs(self.drive_dir, exist_ok=True)
         
         # Hardware detection
@@ -116,6 +119,7 @@ class Config:
         print(f"   GPUs: {self.num_gpus}")
         print(f"   Output: {self.output_dir}")
         print(f"   Data: {self.data_dir}")
+        print(f"   Datasets: {self.datasets_dir}")
 
 config = Config()
 
@@ -299,97 +303,210 @@ class SelectThenPredictModel(nn.Module):
         return model
 
 # ============================================================
-# DATASET LOADERS FOR SELECT-THEN-PREDICT
+# CUSTOM DATASET LOADERS (Using Your Scripts)
 # ============================================================
-def load_esnli_dataset():
-    """Load e-SNLI dataset for Phase 1 pre-training (570k rationale examples)"""
+def load_custom_dataset(script_path, config_name=None, split=None, cache_dir=None):
+    """
+    Load dataset using custom HuggingFace dataset script (not from Hub)
+    
+    Args:
+        script_path: Path to the Python dataset script file (.py)
+        config_name: Configuration name (e.g., "v1.0", "plain_text")
+        split: Split to load (e.g., "train", "validation")
+        cache_dir: Directory to cache the downloaded data
+    """
+    from datasets import load_dataset
+    
+    # Get the directory containing the script
+    script_dir = os.path.dirname(os.path.abspath(script_path))
+    
+    # Load using local path
+    dataset = load_dataset(
+        script_dir,  # Pass directory, not file path
+        name=config_name,
+        split=split,
+        cache_dir=cache_dir or os.path.join(config.data_dir, "cache"),
+        trust_remote_code=True
+    )
+    
+    return dataset
+
+def load_esnli_custom(cache_dir=None):
+    """Load e-SNLI using custom script"""
     try:
-        print("📚 Loading e-SNLI dataset for rationale pre-training...")
-        dataset = load_dataset("esnli")
+        print("📚 Loading e-SNLI using custom script...")
         
-        def convert_format(examples):
-            converted = {
-                'premise': [],
-                'hypothesis': [],
-                'rationale_mask': [],
-                'nli_label': [],
-                'num_sentences': []
-            }
-            
-            for premise, hypothesis, annotation in zip(
-                examples['premise'],
-                examples['hypothesis'],
-                examples['annotation_1']
-            ):
-                # Split premise into sentences (simple sentence splitting)
-                sentences = [s.strip() for s in premise.replace('.', '.\n').split('\n') if s.strip()]
-                if len(sentences) == 0:
-                    sentences = [premise]
-                
-                # Parse rationale annotation (e-SNLI format: highlighted words)
-                # For simplicity, we'll create sentence-level masks based on annotation
-                rationale_mask = [1] * min(len(sentences), config.max_sentences)
-                while len(rationale_mask) < config.max_sentences:
-                    rationale_mask.append(0)
-                
-                # Map NLI labels
-                label_str = annotation.split('\t')[0].lower() if '\t' in annotation else 'neutral'
-                if 'entailment' in label_str:
-                    nli_label = 0
-                elif 'contradiction' in label_str:
-                    nli_label = 1
-                else:
-                    nli_label = 2
-                
-                converted['premise'].append(premise)
-                converted['hypothesis'].append(hypothesis)
-                converted['rationale_mask'].append(rationale_mask[:config.max_sentences])
-                converted['nli_label'].append(nli_label)
-                converted['num_sentences'].append(len(sentences))
-            
-            return converted
+        script_path = os.path.join(config.datasets_dir, "esnli", "esnli.py")
+        
+        if not os.path.exists(script_path):
+            print(f"⚠️ e-SNLI script not found at: {script_path}")
+            print("   Please download the esnli.py script to: datasets/esnli/")
+            return None
+        
+        # Load all splits
+        dataset = load_custom_dataset(
+            script_path=script_path,
+            config_name="plain_text",
+            cache_dir=cache_dir
+        )
         
         # Sample for faster training (e-SNLI is very large)
-        train_sample = dataset['train'].select(range(min(50000, len(dataset['train']))))
-        val_sample = dataset['validation'].select(range(min(5000, len(dataset['validation']))))
+        if 'train' in dataset:
+            train_sample = dataset['train'].select(range(min(50000, len(dataset['train']))))
+        else:
+            train_sample = dataset.select(range(min(50000, len(dataset))))
         
-        train_converted = train_sample.map(convert_format, batched=True, batch_size=1000)
-        val_converted = val_sample.map(convert_format, batched=True, batch_size=1000)
+        if 'validation' in dataset:
+            val_sample = dataset['validation'].select(range(min(5000, len(dataset['validation']))))
+        else:
+            val_sample = train_sample.select(range(min(5000, len(train_sample))))
         
-        print(f"✅ Loaded e-SNLI: {len(train_converted)} training, {len(val_converted)} validation")
+        print(f"✅ Loaded e-SNLI: {len(train_sample)} training, {len(val_sample)} validation")
         return DatasetDict({
-            'train': train_converted,
-            'validation': val_converted
+            'train': train_sample,
+            'validation': val_sample
         })
     
     except Exception as e:
         print(f"⚠️ Failed to load e-SNLI: {e}")
         return None
 
-def load_eraser_dataset():
+def load_fever_custom(cache_dir=None):
+    """Load FEVER using custom script"""
+    try:
+        print("📚 Loading FEVER using custom script...")
+        
+        script_path = os.path.join(config.datasets_dir, "fever", "fever.py")
+        
+        if not os.path.exists(script_path):
+            print(f"⚠️ FEVER script not found at: {script_path}")
+            print("   Please download the fever.py script to: datasets/fever/")
+            return None
+        
+        # Load v1.0 config
+        dataset = load_custom_dataset(
+            script_path=script_path,
+            config_name="v1.0",
+            cache_dir=cache_dir
+        )
+        
+        # Sample for training
+        if 'train' in dataset:
+            train_sample = dataset['train'].select(range(min(10000, len(dataset['train']))))
+        else:
+            train_sample = dataset.select(range(min(10000, len(dataset))))
+        
+        if 'labelled_dev' in dataset:
+            val_sample = dataset['labelled_dev'].select(range(min(2000, len(dataset['labelled_dev']))))
+        else:
+            val_sample = train_sample.select(range(min(2000, len(train_sample))))
+        
+        print(f"✅ Loaded FEVER: {len(train_sample)} training, {len(val_sample)} validation")
+        return DatasetDict({
+            'train': train_sample,
+            'validation': val_sample
+        })
+    
+    except Exception as e:
+        print(f"⚠️ Failed to load FEVER: {e}")
+        return None
+
+def load_scifact_custom(cache_dir=None):
+    """Load SciFact using custom script"""
+    try:
+        print("📚 Loading SciFact using custom script...")
+        
+        script_path = os.path.join(config.datasets_dir, "scifact", "scifact.py")
+        
+        if not os.path.exists(script_path):
+            print(f"⚠️ SciFact script not found at: {script_path}")
+            print("   Please download the scifact.py script to: datasets/scifact/")
+            return None
+        
+        # Load claims config (not corpus)
+        dataset = load_custom_dataset(
+            script_path=script_path,
+            config_name="claims",
+            cache_dir=cache_dir
+        )
+        
+        # Convert to Select-then-Predict format
+        def convert_format(examples):
+            converted = {
+                'claim': [],
+                'evidence_sentences': [],
+                'rationale_mask': [],
+                'nli_label': [],
+                'num_sentences': []
+            }
+            
+            for claim, evidence_label, evidence_sentences in zip(
+                examples['claim'],
+                examples.get('evidence_label', [''] * len(examples['claim'])),
+                examples.get('evidence_sentences', [[]] * len(examples['claim']))
+            ):
+                # Handle evidence sentences
+                sentences = evidence_sentences if isinstance(evidence_sentences, list) else []
+                if len(sentences) == 0:
+                    sentences = ["No evidence available"]
+                
+                # Create rationale mask (1 if evidence_label is SUPPORT/REFUTE, else 0)
+                rationale = [1] * min(len(sentences), config.max_sentences) if evidence_label in ['SUPPORT', 'REFUTES'] else [0] * min(len(sentences), config.max_sentences)
+                while len(rationale) < config.max_sentences:
+                    rationale.append(0)
+                
+                # Map NLI labels
+                if evidence_label == 'SUPPORT':
+                    nli_label = 0
+                elif evidence_label == 'REFUTES':
+                    nli_label = 1
+                else:
+                    nli_label = 2
+                
+                converted['claim'].append(claim)
+                converted['evidence_sentences'].append(sentences[:config.max_sentences])
+                converted['rationale_mask'].append(rationale)
+                converted['nli_label'].append(nli_label)
+                converted['num_sentences'].append(len(sentences))
+            
+            return converted
+        
+        if 'train' in dataset:
+            train_converted = dataset['train'].map(convert_format, batched=True, batch_size=100)
+            val_split = dataset.get('validation', dataset['train'].select(range(min(500, len(dataset['train'])))))
+            val_converted = val_split.map(convert_format, batched=True, batch_size=100)
+        else:
+            # Single split dataset
+            converted = dataset.map(convert_format, batched=True, batch_size=100)
+            train_converted = converted.select(range(int(len(converted) * 0.8)))
+            val_converted = converted.select(range(int(len(converted) * 0.8), len(converted)))
+        
+        print(f"✅ Loaded SciFact: {len(train_converted)} training, {len(val_converted)} validation")
+        return DatasetDict({
+            'train': train_converted,
+            'validation': val_converted
+        })
+    
+    except Exception as e:
+        print(f"⚠️ Failed to load SciFact: {e}")
+        return None
+
+def load_eraser_dataset(cache_dir=None):
     """Load ERASER MultiRC + FEVER for Phase 2 domain adaptation"""
     try:
         print("📚 Loading ERASER datasets for domain adaptation...")
         
-        # MultiRC (multi-sentence reasoning)
+        # Try loading from HuggingFace Hub first (if available)
         try:
-            multirc = load_dataset("eraser_multi_rc")
-            print(f"✅ Loaded MultiRC: {len(multirc['train'])} examples")
+            multirc = load_dataset("eraser_multi_rc", cache_dir=cache_dir)
+            print(f"✅ Loaded MultiRC from Hub: {len(multirc['train'])} examples")
         except:
+            print("⚠️ MultiRC not available from Hub, skipping...")
             multirc = None
-        
-        # FEVER (fact-checking with rationales)
-        try:
-            fever = load_dataset("fever", "v1.0")
-            print(f"✅ Loaded FEVER: {len(fever['train'])} examples")
-        except:
-            fever = None
         
         datasets = []
         if multirc:
             datasets.append(multirc['train'].select(range(min(10000, len(multirc['train'])))))
-        if fever:
-            datasets.append(fever['train'].select(range(min(10000, len(fever['train'])))))
         
         if datasets:
             combined = concatenate_datasets(datasets).shuffle(seed=42)
@@ -402,91 +519,6 @@ def load_eraser_dataset():
     
     except Exception as e:
         print(f"⚠️ Failed to load ERASER: {e}")
-        return None
-
-def load_scifact_rationale_dataset(path=None):
-    """Load SciFact with sentence-level rationale annotations for Phase 3"""
-    try:
-        print("📚 Loading SciFact with rationale annotations...")
-        
-        # SciFact has rationale annotations in the evidence field
-        if path is None:
-            dataset = load_dataset("allenai/scifact", trust_remote_code=True)
-        else:
-            # Load from local JSONL
-            dataset = load_dataset('json', data_files={'train': path})
-        
-        def convert_format(examples):
-            converted = {
-                'claim': [],
-                'evidence_sentences': [],
-                'rationale_mask': [],
-                'nli_label': [],
-                'num_sentences': []
-            }
-            
-            for claim, evidence in zip(examples['claim'], examples['evidence']):
-                # Extract sentences from evidence
-                sentences = []
-                rationale_mask = []
-                
-                if evidence:
-                    for doc_id, ev_list in evidence.items():
-                        if isinstance(ev_list, list):
-                            for ev in ev_list:
-                                sent_list = ev.get('sentences', [])
-                                label = ev.get('label', '')
-                                
-                                for sent in sent_list:
-                                    sentences.append(str(sent))
-                                    # Mark as rationale if labeled as support/refute
-                                    if label in ['SUPPORT', 'REFUTES']:
-                                        rationale_mask.append(1)
-                                    else:
-                                        rationale_mask.append(0)
-                
-                if len(sentences) == 0:
-                    sentences = ["No evidence available"]
-                    rationale_mask = [0]
-                
-                # Truncate to max_sentences
-                sentences = sentences[:config.max_sentences]
-                rationale_mask = rationale_mask[:config.max_sentences]
-                while len(rationale_mask) < config.max_sentences:
-                    rationale_mask.append(0)
-                
-                # Map NLI labels
-                label = examples.get('final_decision', ['MAYBE'] * len(examples['claim']))[0]
-                if label == 'SUPPORT':
-                    nli_label = 0
-                elif label == 'REFUTE':
-                    nli_label = 1
-                else:
-                    nli_label = 2
-                
-                converted['claim'].append(claim)
-                converted['evidence_sentences'].append(sentences)
-                converted['rationale_mask'].append(rationale_mask)
-                converted['nli_label'].append(nli_label)
-                converted['num_sentences'].append(len(sentences))
-            
-            return converted
-        
-        if 'train' in dataset:
-            train_converted = dataset['train'].map(convert_format, batched=True, batch_size=100)
-            val_split = dataset['train'].select(range(min(500, len(dataset['train']))))
-            val_converted = val_split.map(convert_format, batched=True, batch_size=100)
-            
-            print(f"✅ Loaded SciFact: {len(train_converted)} training, {len(val_converted)} validation")
-            return DatasetDict({
-                'train': train_converted,
-                'validation': val_converted
-            })
-        
-        return None
-    
-    except Exception as e:
-        print(f"⚠️ Failed to load SciFact: {e}")
         return None
 
 # ============================================================
@@ -511,8 +543,9 @@ class SelectPredictDataCollator:
         
         for feature in features:
             # Tokenize claim
+            claim_text = feature.get('claim', feature.get('premise', feature.get('claim_text', '')))
             claim_tokens = self.tokenizer(
-                feature.get('claim', feature.get('premise', feature.get('claim_text', ''))),
+                claim_text,
                 truncation=True,
                 max_length=self.max_length,
                 padding='max_length'
@@ -870,6 +903,7 @@ def main():
     print(f"📁 Base Directory: {config.base_dir}")
     print(f"📁 Output Directory: {config.output_dir}")
     print(f"📁 Data Directory: {config.data_dir}")
+    print(f"📁 Datasets Directory: {config.datasets_dir}")
     print(f"🖥️ Device: {config.device}")
     print(f"🎯 Target NLI F1: {config.target_nli_f1}")
     print(f"🎯 Target Rationale AUPRC: {config.target_auprc}")
@@ -884,20 +918,24 @@ def main():
     tokenizer.add_special_tokens({'additional_special_tokens': ["[CLAIM]", "[EVIDENCE]"]})
     
     # ============================================================
-    # LOAD DATASETS
+    # LOAD DATASETS USING CUSTOM SCRIPTS
     # ============================================================
     print("\n" + "="*70)
-    print("📚 LOADING DATASETS FOR ALL 3 PHASES")
+    print("📚 LOADING DATASETS USING CUSTOM SCRIPTS")
     print("="*70)
     
-    # Phase 1: e-SNLI
-    esnli_data = load_esnli_dataset()
+    cache_dir = os.path.join(config.data_dir, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
     
-    # Phase 2: ERASER
-    eraser_data = load_eraser_dataset()
+    # Phase 1: e-SNLI (custom script)
+    esnli_data = load_esnli_custom(cache_dir=cache_dir)
     
-    # Phase 3: SciFact
-    scifact_data = load_scifact_rationale_dataset()
+    # Phase 2: ERASER + FEVER (custom script for FEVER)
+    eraser_data = load_eraser_dataset(cache_dir=cache_dir)
+    fever_data = load_fever_custom(cache_dir=cache_dir)
+    
+    # Phase 3: SciFact (custom script)
+    scifact_data = load_scifact_custom(cache_dir=cache_dir)
     
     # ============================================================
     # INITIALIZE MODEL
@@ -921,7 +959,7 @@ def main():
     phase1_checkpoint = None
     phase2_checkpoint = None
     
-    # Phase 1: Pre-training
+    # Phase 1: Pre-training (e-SNLI)
     if esnli_data:
         phase1_checkpoint = train_phase_1_pretrain(
             model, tokenizer,
@@ -937,21 +975,30 @@ def main():
         model.save_pretrained(phase1_checkpoint)
         tokenizer.save_pretrained(phase1_checkpoint)
     
-    # Phase 2: Domain Adaptation
-    if eraser_
+    # Phase 2: Domain Adaptation (ERASER + FEVER)
+    phase2_datasets = []
+    if eraser_data:
+        phase2_datasets.append(eraser_data['train'])
+    if fever_data:
+        phase2_datasets.append(fever_data['train'])
+    
+    if phase2_datasets:
+        combined_train = concatenate_datasets(phase2_datasets).shuffle(seed=42)
+        combined_val = combined_train.select(range(min(2000, len(combined_train))))
+        
         phase2_checkpoint, model = train_phase_2_domain_adapt(
             model, tokenizer,
-            eraser_data['train'],
-            eraser_data['validation'],
+            combined_train,
+            combined_val,
             phase1_checkpoint,
             output_dir
         )
     else:
-        print("⚠️ Skipping Phase 2 (ERASER not available)")
+        print("⚠️ Skipping Phase 2 (ERASER/FEVER not available)")
         phase2_checkpoint = phase1_checkpoint
     
-    # Phase 3: Biomedical Fine-tuning
-    if scifact_
+    # Phase 3: Biomedical Fine-tuning (SciFact)
+    if scifact_data:
         final_path, model, trainer = train_phase_3_finetune(
             model, tokenizer,
             scifact_data['train'],
