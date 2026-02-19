@@ -1,15 +1,15 @@
 # ============================================================
-# ARIYAAM v3.0 — OPENBIOLLM-8B BIOMEDICAL SUMMARIZER (QLoRA)
-# Module: 03_llama_summ.py (VS Code Compatible - UPDATED)
+# ARIYAAM v3.0 — LLAMA-3-OpenBioLLM-8B BIOMEDICAL SUMMARIZER (QLoRA)
+# Module: 03_llama_summ.py (VS Code Compatible + Auto-Download)
 # Target: Scientific synthesis + Layman simplification via prompt conditioning
-# ✅ MODEL: aaditya/Llama3-OpenBioLLM-8B (already biomedical fine-tuned)
-# ✅ DATASETS: BioLaySumm2025-PLOS + Med-EASi (cbasu) + MS2
-# ✅ REMOVED: PLABA (repository no longer exists)
+# ✅ MODEL: aaditya/Llama3-OpenBioLLM-8B (biomedical pre-fine-tuned)
+# ✅ DATASETS: allenai/mslr2022, BioLaySumm2025-PLOS, cbasu/Med-EASi
+# ✅ AUTO-DOWNLOAD: HuggingFace datasets with local fallback
 # ✅ FIXED: Colab dependencies removed for local execution
 # ✅ FIXED: Windows multiprocessing guards added
 # ✅ FIXED: All paths are local/relative (no /content/)
 # ✅ IMPLEMENTED: QLoRA 4-bit quantization + LoRA adapters
-# ✅ IMPLEMENTED: Two-stage fine-tuning (MS2 → BioLaySumm2025 + Med-EASi)
+# ✅ IMPLEMENTED: Two-stage fine-tuning (MS2 → BioLaySumm/MedEasi)
 # ✅ IMPLEMENTED: Dual-register prompting (scientific + layman)
 # ============================================================
 
@@ -21,6 +21,9 @@ import torch
 import datetime
 import warnings
 import json
+import shutil
+import tarfile
+import csv
 import multiprocessing as mp
 from pathlib import Path
 from typing import List, Dict, Optional, Union
@@ -31,7 +34,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 from tqdm import tqdm
-from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk, load_dataset
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -61,7 +64,7 @@ plt.rcParams['figure.dpi'] = 150
 plt.rcParams['savefig.dpi'] = 300
 
 # ============================================================
-# CONFIGURATION — VS CODE LOCAL PATHS + UPDATED MODEL/DATASETS
+# CONFIGURATION — VS CODE LOCAL PATHS
 # ============================================================
 @dataclass
 class Config:
@@ -75,7 +78,7 @@ class Config:
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
     num_gpus: int = field(default_factory=lambda: torch.cuda.device_count())
     
-    # ✅ UPDATED MODEL: OpenBioLLM-8B (already biomedical fine-tuned)
+    # ✅ MODEL: OpenBioLLM (biomedical pre-fine-tuned Llama-3)
     model_name: str = "aaditya/Llama3-OpenBioLLM-8B"
     tokenizer_name: str = "aaditya/Llama3-OpenBioLLM-8B"
     
@@ -85,9 +88,9 @@ class Config:
     bnb_4bit_compute_dtype: str = "float16"
     bnb_4bit_use_double_quant: bool = True
     
-    # LoRA configuration (slightly reduced rank since OpenBioLLM is already fine-tuned)
-    lora_rank: int = 8  # Reduced from 16 (model already has biomedical knowledge)
-    lora_alpha: int = 16
+    # LoRA configuration
+    lora_rank: int = 16
+    lora_alpha: int = 32
     lora_dropout: float = 0.05
     lora_target_modules: List[str] = field(default_factory=lambda: [
         "q_proj", "k_proj", "v_proj", "o_proj",
@@ -99,25 +102,22 @@ class Config:
     max_new_tokens: int = 512
     batch_size: int = 1  # QLoRA memory constraints
     gradient_accumulation_steps: int = 16  # Effective batch = 16
-    stage1_epochs: int = 2  # MS2 scientific synthesis (reduced: OpenBioLLM already knows biomedical)
-    stage2_epochs: int = 2  # BioLaySumm2025 + Med-EASi layman simplification
-    learning_rate: float = 1e-4  # Lower LR since model is already fine-tuned
+    stage1_epochs: int = 3  # MS2 scientific synthesis
+    stage2_epochs: int = 2  # BioLaySumm layman simplification
+    learning_rate: float = 2e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
     lr_scheduler_type: str = "cosine"
     max_grad_norm: float = 0.3
     
-    # ✅ UPDATED DATASET CONFIGURATION
-    ms2_samples: int = 15000  # Slightly reduced
-    biolaysumm2025_samples: int = 10000  # BioLaySumm2025-PLOS
-    medeasi_samples: int = 2000  # Med-EASi (cbasu)
+    # Dataset configuration (auto-download from HF)
+    ms2_samples: int = 20000  # Limit for training speed
+    biolaysumm_samples: int = 15000
+    medeasi_samples: int = 500
     
-    # ✅ REMOVED: PLABA (repository no longer exists)
-    # plaba_samples: int = 0  # Not used
-    
-    # Prompt templates (optimized for OpenBioLLM instruction format)
+    # Prompt templates (OpenBioLLM uses Llama-3 chat format)
     scientific_prompt: str = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-You are a biomedical research assistant. Synthesize the provided evidence passages into a concise verdict summary for the given claim. Follow these rules:
+You are a biomedical scientist. Synthesize the provided evidence passages into a concise verdict summary for the given claim. Follow these rules:
 1. Start with the verdict: SUPPORT, REFUTE, or NOT_ENOUGH_INFO
 2. Cite evidence inline using [Evidence 1], [Evidence 2], etc.
 3. Keep summary under 200 words
@@ -149,10 +149,10 @@ Rewrite for a general audience:
 <|eot_id|><|start_header_id|>assistant<|end_header_id|>
 """
     
-    # Evaluation targets (adjusted for OpenBioLLM baseline)
-    target_rouge_l: float = 0.38  # Slightly higher expectation (model already biomedical)
-    target_bertscore: float = 0.87
-    target_sari: float = 0.42
+    # Evaluation targets
+    target_rouge_l: float = 0.35
+    target_bertscore: float = 0.85
+    target_sari: float = 0.40
     target_fk_grade: float = 8.0
     
     # Reproducibility
@@ -171,8 +171,6 @@ Rewrite for a general audience:
         print(f"   Data: {self.data_dir}")
         print(f"   Model: {self.model_name}")
         print(f"   QLoRA: 4-bit={self.load_in_4bit}, rank={self.lora_rank}")
-        print(f"   Datasets: MS2 + BioLaySumm2025-PLOS + Med-EASi (cbasu)")
-        print(f"   ⚠️ PLABA removed (repository no longer exists)")
 
 config = Config()
 
@@ -193,112 +191,191 @@ def set_seed(seed=42):
 set_seed(config.seed)
 
 # ============================================================
-# LOCAL DATASET LOADERS (UPDATED FOR NEW SOURCES)
+# AUTO-DOWNLOAD HELPERS
 # ============================================================
-def load_ms2_local(data_dir, split='train', max_samples=None):
-    """Load MS2 (Multi-Document Summarization of Medical Studies) from local files or HF"""
-    print(f"📚 Loading MS2 from: {data_dir}")
+def ensure_hf_auth():
+    """Check for HuggingFace token and prompt if missing"""
+    hf_token = os.environ.get("HF_TOKEN")
+    if not hf_token:
+        print("⚠️ HF_TOKEN not set in environment.")
+        print("   Some datasets require authentication.")
+        print("   Set it with: export HF_TOKEN=your_token_here")
+        print("   Or get one at: https://huggingface.co/settings/tokens")
+        # Continue anyway - some datasets are public
+    return hf_token
+
+def download_and_extract_tar(url: str, extract_to: str, expected_files: List[str] = None) -> bool:
+    """Download and extract a tar.gz file with progress bar"""
+    import requests
+    from tqdm import tqdm
     
-    # Try local first, fallback to HF load_dataset
-    local_path = os.path.join(data_dir, 'ms2', f"{split}.jsonl")
+    os.makedirs(extract_to, exist_ok=True)
+    tar_path = os.path.join(extract_to, os.path.basename(url))
     
-    if os.path.exists(local_path):
-        print(f"   Loading from local file: {local_path}")
-        data = []
-        with open(local_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f):
-                try:
-                    row = json.loads(line.strip())
-                except json.JSONDecodeError:
+    if os.path.exists(tar_path):
+        print(f"✅ Archive already exists: {tar_path}")
+    else:
+        print(f"⬇️ Downloading {url}...")
+        try:
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+            total_size = int(response.headers.get('content-length', 0))
+            
+            with open(tar_path, 'wb') as f, tqdm(
+                total=total_size, unit='B', unit_scale=True, desc=os.path.basename(url)
+            ) as pbar:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+            print(f"✅ Downloaded to: {tar_path}")
+        except Exception as e:
+            print(f"❌ Download failed: {e}")
+            return False
+    
+    # Extract
+    extract_dir = os.path.join(extract_to, "extracted")
+    if not os.path.exists(extract_dir) or not all(
+        os.path.exists(os.path.join(extract_dir, f)) for f in (expected_files or [])
+    ):
+        print(f"📦 Extracting to: {extract_dir}")
+        try:
+            with tarfile.open(tar_path, 'r:gz') as tar:
+                tar.extractall(path=extract_dir)
+            print(f"✅ Extraction complete")
+        except Exception as e:
+            print(f"❌ Extraction failed: {e}")
+            return False
+    
+    return True
+
+def load_mslr2022_local(data_dir: str, split: str = 'train', dataset: str = 'ms2', 
+                       max_samples: int = None, auto_download: bool = True) -> Optional[Dataset]:
+    """
+    Load MSLR2022 dataset (MS^2 or Cochrane) from local files or auto-download from HF.
+    
+    Args:
+        data_dir: Base data directory
+        split: 'train', 'dev', or 'test'
+        dataset: 'ms2' or 'cochrane'
+        max_samples: Limit number of examples (for testing)
+        auto_download: If True, try HF load_dataset first, then fallback to manual download
+    """
+    print(f"📚 Loading MSLR2022/{dataset} {split}...")
+    
+    # Try HuggingFace load_dataset first (auto-download)
+    if auto_download:
+        try:
+            print(f"   Attempting HF download: allenai/mslr2022 ({dataset}, {split})")
+            hf_dataset = load_dataset("allenai/mslr2022", name=dataset, split=split, trust_remote_code=True)
+            
+            # Convert to our format
+            data = []
+            for i, row in enumerate(hf_dataset):
+                # MSLR format: ReviewID, PMID, Title, Abstract, Target
+                claim = f"Synthesize findings from study {row.get('PMID', 'unknown')}"
+                evidence = f"[Evidence 1] {row.get('Title', '')}: {row.get('Abstract', '')}"
+                reference = row.get('Target', '')
+                
+                if not reference or not evidence:
                     continue
-                
-                cluster_id = row.get('cluster_id', f"ms2_{line_num}")
-                papers = row.get('papers', [])
-                reference_summary = row.get('summary', '')
-                
-                if not papers or not reference_summary:
-                    continue
-                
-                # Format evidence passages
-                evidence_texts = []
-                for i, paper in enumerate(papers[:5]):
-                    title = paper.get('title', '')
-                    abstract = paper.get('abstract', '')
-                    evidence_texts.append(f"[Evidence {i+1}] {title}: {abstract}")
-                
-                evidence = "\n\n".join(evidence_texts)
                 
                 data.append({
-                    'claim': f"Synthesize findings from {len(papers)} studies",
+                    'claim': claim,
                     'evidence': evidence,
-                    'reference_summary': reference_summary,
+                    'reference_summary': reference,
                     'register': 'scientific',
-                    'source': 'ms2',
-                    'cluster_id': str(cluster_id)
+                    'source': f'mslr2022_{dataset}',
+                    'review_id': str(row.get('ReviewID', i)),
+                    'pmid': str(row.get('PMID', ''))
                 })
                 
                 if max_samples and len(data) >= max_samples:
                     break
-        
-        if data:
-            print(f"✅ Loaded {len(data)} MS2 {split} examples from local")
-            return Dataset.from_list(data)
-    
-    # Fallback to HF load_dataset
-    try:
-        print(f"   Local not found, loading from HuggingFace: allenai/ms2")
-        dataset = load_dataset("allenai/ms2", split=split if split != 'dev' else 'validation')
-        
-        def convert_ms2(example):
-            papers = example.get('papers', [])
-            evidence_texts = []
-            for i, paper in enumerate(papers[:5]):
-                title = paper.get('title', '')
-                abstract = paper.get('abstract', '')
-                evidence_texts.append(f"[Evidence {i+1}] {title}: {abstract}")
             
-            return {
-                'claim': f"Synthesize findings from {len(papers)} studies",
-                'evidence': "\n\n".join(evidence_texts),
-                'reference_summary': example.get('summary', ''),
-                'register': 'scientific',
-                'source': 'ms2',
-                'cluster_id': str(example.get('cluster_id', ''))
-            }
-        
-        dataset = dataset.map(convert_ms2, batched=False)
-        if max_samples:
-            dataset = dataset.select(range(min(max_samples, len(dataset))))
-        
-        print(f"✅ Loaded {len(dataset)} MS2 {split} examples from HF")
-        return dataset
+            if data:
+                print(f"✅ Loaded {len(data)} MSLR2022/{dataset} {split} examples from HF")
+                return Dataset.from_list(data)
+        except Exception as e:
+            print(f"⚠️ HF load_dataset failed: {e}")
+            print("   Falling back to manual download...")
     
-    except Exception as e:
-        print(f"⚠️ Failed to load MS2: {e}")
+    # Fallback: Manual download from AI2 S3
+    mslr_dir = os.path.join(data_dir, 'mslr2022')
+    os.makedirs(mslr_dir, exist_ok=True)
+    
+    tar_url = "https://ai2-s2-mslr.s3.us-west-2.amazonaws.com/mslr_data.tar.gz"
+    extract_path = os.path.join(mslr_dir, 'extracted')
+    
+    if not os.path.exists(os.path.join(extract_path, dataset)):
+        if not download_and_extract_tar(
+            tar_url, 
+            mslr_dir, 
+            expected_files=[f"{dataset}/{split}-inputs.csv", f"{dataset}/{split}-targets.csv"]
+        ):
+            print(f"❌ Could not download MSLR2022 data")
+            return None
+    
+    # Load from CSV files
+    dataset_dir = os.path.join(extract_path, dataset)
+    inputs_file = os.path.join(dataset_dir, f"{split}-inputs.csv")
+    targets_file = os.path.join(dataset_dir, f"{split}-targets.csv")
+    
+    if not os.path.exists(inputs_file) or not os.path.exists(targets_file):
+        print(f"⚠️ Files not found: {inputs_file} or {targets_file}")
         return None
+    
+    # Load inputs and targets
+    inputs_df = pd.read_csv(inputs_file)
+    targets_df = pd.read_csv(targets_file)
+    
+    # Merge on ReviewID
+    merged = pd.merge(inputs_df, targets_df, on='ReviewID', suffixes=('_input', '_target'))
+    
+    data = []
+    for i, row in merged.iterrows():
+        claim = f"Synthesize findings from study {row.get('PMID', 'unknown')}"
+        evidence = f"[Evidence 1] {row.get('Title_input', '')}: {row.get('Abstract_input', '')}"
+        reference = row.get('Target', '')
+        
+        if not reference or not evidence:
+            continue
+        
+        data.append({
+            'claim': claim,
+            'evidence': evidence,
+            'reference_summary': reference,
+            'register': 'scientific',
+            'source': f'mslr2022_{dataset}',
+            'review_id': str(row.get('ReviewID', i)),
+            'pmid': str(row.get('PMID_input', ''))
+        })
+        
+        if max_samples and len(data) >= max_samples:
+            break
+    
+    if not data:
+        print(f"⚠️ No MSLR2022/{dataset} {split} data loaded")
+        return None
+    
+    print(f"✅ Loaded {len(data)} MSLR2022/{dataset} {split} examples from local files")
+    return Dataset.from_list(data)
 
-def load_biolaysumm2025_plos_local(data_dir, split='train', max_samples=None):
-    """Load BioLaySumm2025-PLOS from local files or HF"""
-    print(f"📚 Loading BioLaySumm2025-PLOS from: {data_dir}")
+def load_biolaysumm_2025_local(data_dir: str, split: str = 'train', 
+                               max_samples: int = None, auto_download: bool = True) -> Optional[Dataset]:
+    """Load BioLaySumm 2025 PLOS from HF or local files"""
+    print(f"📚 Loading BioLaySumm2025-PLOS {split}...")
     
-    # Try local first
-    local_path = os.path.join(data_dir, 'biolaysumm2025_plos', f"{split}.jsonl")
-    
-    if os.path.exists(local_path):
-        print(f"   Loading from local file: {local_path}")
-        data = []
-        with open(local_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f):
-                try:
-                    row = json.loads(line.strip())
-                except json.JSONDecodeError:
-                    continue
-                
-                # BioLaySumm2025-PLOS format may differ from 2023
-                # Expected: paper_id, abstract, lay_summary, domain
-                paper_id = row.get('paper_id', row.get('id', f"biolay2025_{line_num}"))
-                abstract = row.get('abstract', row.get('technical_abstract', ''))
-                lay_summary = row.get('lay_summary', row.get('plain_summary', ''))
+    if auto_download:
+        try:
+            print(f"   Attempting HF download: BioLaySumm/BioLaySumm2025-PLOS")
+            hf_dataset = load_dataset("BioLaySumm/BioLaySumm2025-PLOS", split=split, trust_remote_code=True)
+            
+            data = []
+            for i, row in enumerate(hf_dataset):
+                # BioLaySumm format: paper_id, abstract, lay_summary
+                abstract = row.get('abstract', '')
+                lay_summary = row.get('lay_summary', '')
                 
                 if not abstract or not lay_summary:
                     continue
@@ -308,69 +385,74 @@ def load_biolaysumm2025_plos_local(data_dir, split='train', max_samples=None):
                     'evidence': f"[Evidence 1] {abstract}",
                     'reference_summary': lay_summary,
                     'register': 'layman',
-                    'source': 'biolaysumm2025_plos',
-                    'paper_id': str(paper_id),
-                    'domain': row.get('domain', 'general')
+                    'source': 'biolaysumm_2025_plos',
+                    'paper_id': str(row.get('paper_id', f'biolay_{i}'))
                 })
                 
                 if max_samples and len(data) >= max_samples:
                     break
-        
-        if data:
-            print(f"✅ Loaded {len(data)} BioLaySumm2025-PLOS {split} examples from local")
-            return Dataset.from_list(data)
-    
-    # Fallback to HF load_dataset
-    try:
-        print(f"   Local not found, loading from HuggingFace: BioLaySumm/BioLaySumm2025-PLOS")
-        dataset = load_dataset("BioLaySumm/BioLaySumm2025-PLOS", split=split if split != 'dev' else 'validation')
-        
-        def convert_biolay2025(example):
-            abstract = example.get('abstract', example.get('technical_abstract', ''))
-            lay_summary = example.get('lay_summary', example.get('plain_summary', ''))
             
-            return {
+            if data:
+                print(f"✅ Loaded {len(data)} BioLaySumm2025-PLOS {split} examples from HF")
+                return Dataset.from_list(data)
+        except Exception as e:
+            print(f"⚠️ HF load_dataset failed: {e}")
+    
+    # Fallback: Local files
+    filepath = os.path.join(data_dir, 'biolaysumm_2025_plos', f"{split}.jsonl")
+    if not os.path.exists(filepath):
+        print(f"⚠️ Local file not found: {filepath}")
+        print("   Please download from: https://huggingface.co/datasets/BioLaySumm/BioLaySumm2025-PLOS")
+        return None
+    
+    data = []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f):
+            try:
+                row = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+            
+            abstract = row.get('abstract', '')
+            lay_summary = row.get('lay_summary', '')
+            
+            if not abstract or not lay_summary:
+                continue
+            
+            data.append({
                 'claim': 'Explain this research simply',
                 'evidence': f"[Evidence 1] {abstract}",
                 'reference_summary': lay_summary,
                 'register': 'layman',
-                'source': 'biolaysumm2025_plos',
-                'paper_id': str(example.get('paper_id', example.get('id', ''))),
-                'domain': example.get('domain', 'general')
-            }
-        
-        dataset = dataset.map(convert_biolay2025, batched=False)
-        if max_samples:
-            dataset = dataset.select(range(min(max_samples, len(dataset))))
-        
-        print(f"✅ Loaded {len(dataset)} BioLaySumm2025-PLOS {split} examples from HF")
-        return dataset
+                'source': 'biolaysumm_2025_plos',
+                'paper_id': str(row.get('paper_id', f'biolay_{line_num}'))
+            })
+            
+            if max_samples and len(data) >= max_samples:
+                break
     
-    except Exception as e:
-        print(f"⚠️ Failed to load BioLaySumm2025-PLOS: {e}")
-        print(f"   Note: Dataset path is BioLaySumm/BioLaySumm2025-PLOS (not BioLaySumm2023)")
+    if not data:
+        print(f"⚠️ No BioLaySumm2025-PLOS data loaded")
         return None
+    
+    print(f"✅ Loaded {len(data)} BioLaySumm2025-PLOS {split} examples from local files")
+    return Dataset.from_list(data)
 
-def load_medeasi_cbasu_local(data_dir, split='train', max_samples=None):
-    """Load Med-EASi from cbasu/Med-EASi (local or HF)"""
-    print(f"📚 Loading Med-EASi (cbasu) from: {data_dir}")
+def load_medeasi_local(data_dir: str, split: str = 'train', 
+                       max_samples: int = None, auto_download: bool = True) -> Optional[Dataset]:
+    """Load Med-EASi from HF or local files (updated dataset name)"""
+    print(f"📚 Loading Med-EASi {split}...")
     
-    # Try local first
-    local_path = os.path.join(data_dir, 'medeasi_cbasu', f"{split}.jsonl")
-    
-    if os.path.exists(local_path):
-        print(f"   Loading from local file: {local_path}")
-        data = []
-        with open(local_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f):
-                try:
-                    row = json.loads(line.strip())
-                except json.JSONDecodeError:
-                    continue
-                
-                # cbasu/Med-EASi format
-                original = row.get('original', row.get('technical', row.get('source', '')))
-                simplified = row.get('simplified', row.get('plain', row.get('target', '')))
+    if auto_download:
+        try:
+            print(f"   Attempting HF download: cbasu/Med-EASi")
+            hf_dataset = load_dataset("cbasu/Med-EASi", split=split, trust_remote_code=True)
+            
+            data = []
+            for i, row in enumerate(hf_dataset):
+                # Med-EASi format: original, simplified
+                original = row.get('original', '')
+                simplified = row.get('simplified', '')
                 
                 if not original or not simplified:
                     continue
@@ -380,49 +462,58 @@ def load_medeasi_cbasu_local(data_dir, split='train', max_samples=None):
                     'evidence': f"[Evidence 1] {original}",
                     'reference_summary': simplified,
                     'register': 'layman',
-                    'source': 'medeasi_cbasu',
-                    'example_id': f"medeasi_cbasu_{line_num}",
-                    'complexity': row.get('complexity', 'medium')
+                    'source': 'med_easi',
+                    'example_id': f'medeasi_{i}'
                 })
                 
                 if max_samples and len(data) >= max_samples:
                     break
-        
-        if data:
-            print(f"✅ Loaded {len(data)} Med-EASi (cbasu) {split} examples from local")
-            return Dataset.from_list(data)
-    
-    # Fallback to HF load_dataset
-    try:
-        print(f"   Local not found, loading from HuggingFace: cbasu/Med-EASi")
-        dataset = load_dataset("cbasu/Med-EASi", split=split if split != 'dev' else 'validation')
-        
-        def convert_medeasi_cbasu(example):
-            original = example.get('original', example.get('technical', example.get('source', '')))
-            simplified = example.get('simplified', example.get('plain', example.get('target', '')))
             
-            return {
+            if data:
+                print(f"✅ Loaded {len(data)} Med-EASi {split} examples from HF")
+                return Dataset.from_list(data)
+        except Exception as e:
+            print(f"⚠️ HF load_dataset failed: {e}")
+    
+    # Fallback: Local files
+    filepath = os.path.join(data_dir, 'med_easi', f"{split}.jsonl")
+    if not os.path.exists(filepath):
+        print(f"⚠️ Local file not found: {filepath}")
+        print("   Please download from: https://huggingface.co/datasets/cbasu/Med-EASi")
+        return None
+    
+    data = []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f):
+            try:
+                row = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+            
+            original = row.get('original', '')
+            simplified = row.get('simplified', '')
+            
+            if not original or not simplified:
+                continue
+            
+            data.append({
                 'claim': 'Rewrite in plain language',
                 'evidence': f"[Evidence 1] {original}",
                 'reference_summary': simplified,
                 'register': 'layman',
-                'source': 'medeasi_cbasu',
-                'example_id': str(example.get('id', '')),
-                'complexity': example.get('complexity', 'medium')
-            }
-        
-        dataset = dataset.map(convert_medeasi_cbasu, batched=False)
-        if max_samples:
-            dataset = dataset.select(range(min(max_samples, len(dataset))))
-        
-        print(f"✅ Loaded {len(dataset)} Med-EASi (cbasu) {split} examples from HF")
-        return dataset
+                'source': 'med_easi',
+                'example_id': f'medeasi_{line_num}'
+            })
+            
+            if max_samples and len(data) >= max_samples:
+                break
     
-    except Exception as e:
-        print(f"⚠️ Failed to load Med-EASi (cbasu): {e}")
+    if not data:
+        print(f"⚠️ No Med-EASi data loaded")
         return None
-
-# ✅ REMOVED: load_plaba_local() - repository no longer exists
+    
+    print(f"✅ Loaded {len(data)} Med-EASi {split} examples from local files")
+    return Dataset.from_list(data)
 
 def format_training_example(example, prompt_template, register='scientific'):
     """Format a single example for instruction tuning"""
@@ -449,10 +540,10 @@ def format_training_example(example, prompt_template, register='scientific'):
     }
 
 # ============================================================
-# QLoRA MODEL LOADING (UPDATED FOR OPENBIOLLM)
+# QLoRA MODEL LOADING (OpenBioLLM)
 # ============================================================
 def load_openbiollm_qlora(model_name=None):
-    """Load OpenBioLLM-8B with QLoRA configuration"""
+    """Load Llama3-OpenBioLLM-8B with QLoRA configuration"""
     if model_name is None:
         model_name = config.model_name
     
@@ -471,11 +562,10 @@ def load_openbiollm_qlora(model_name=None):
         config.tokenizer_name if config.tokenizer_name else model_name,
         use_fast=True,
         padding_side='right',
-        truncation_side='right',
-        trust_remote_code=True
+        truncation_side='right'
     )
     
-    # Add special tokens if needed (OpenBioLLM uses Llama-3 tokenizer)
+    # Add special tokens if needed (OpenBioLLM uses Llama-3 chat format)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.unk_token is None:
@@ -494,9 +584,9 @@ def load_openbiollm_qlora(model_name=None):
     # Prepare model for k-bit training
     model = prepare_model_for_kbit_training(model)
     
-    # Configure LoRA (reduced rank since OpenBioLLM is already biomedical)
+    # Configure LoRA
     lora_config = LoraConfig(
-        r=config.lora_rank,  # 8 instead of 16 (model already fine-tuned)
+        r=config.lora_rank,
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,
         bias="none",
@@ -516,7 +606,6 @@ def load_openbiollm_qlora(model_name=None):
     print(f"   Trainable params: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
     print(f"   Total params: {total_params:,}")
     print(f"   Memory footprint: ~{total_params * 2 / 1e9:.1f} GB (4-bit)")
-    print(f"   Note: OpenBioLLM-8B is already biomedical fine-tuned - reduced LoRA rank for efficiency")
     
     return model, tokenizer
 
@@ -683,6 +772,7 @@ class SummarizerLoggingCallback(TrainerCallback):
                 print(f"   --- Sample {idx+1} ---")
                 print(f"   Reference: {reference[:100]}...")
                 print(f"   Generated: {generated[:100]}...")
+                print()
             
             model.train()
         
@@ -868,7 +958,7 @@ def generate_training_plots(trainer, output_dir, timestamp, stage_name):
 def main():
     """Main training entry point - Windows multiprocessing safe"""
     print("\n" + "="*80)
-    print("🔬 ARIYAAM v3.0 — OPENBIOLLM-8B SUMMARIZER (QLoRA)")
+    print("🔬 ARIYAAM v3.0 — OpenBioLLM-8B SUMMARIZER (QLoRA + Auto-Download)")
     print("="*80)
     print(f"📁 Base: {config.base_dir}")
     print(f"📁 Data: {config.data_dir}")
@@ -876,9 +966,10 @@ def main():
     print(f"🖥️ Device: {config.device}")
     print(f"🎯 Model: {config.model_name}")
     print(f"🎯 Target: ROUGE-L >{config.target_rouge_l}, BERTScore >{config.target_bertscore}")
-    print(f"📚 Datasets: MS2 + BioLaySumm2025-PLOS + Med-EASi (cbasu)")
-    print(f"⚠️ PLABA: Removed (repository no longer exists)")
     print("="*80)
+    
+    # Check HF auth
+    ensure_hf_auth()
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(config.output_dir, f"openbiollm_summarizer_{timestamp}")
@@ -891,54 +982,91 @@ def main():
     print(f"📥 LOADING {config.model_name} WITH QLoRA")
     print("="*70)
     
-    # OpenBioLLM-8B is publicly available, no HF token required
-    # But still check for auth in case of rate limiting
-    hf_token = os.environ.get("HF_TOKEN")
-    if hf_token:
-        print(f"✅ Using HF token for authentication")
-    
     model, tokenizer = load_openbiollm_qlora()
     
     # ============================================================
-    # LOAD DATASETS (UPDATED SOURCES)
+    # LOAD DATASETS (AUTO-DOWNLOAD FROM HF WITH FALLBACK)
     # ============================================================
     print("\n" + "="*70)
-    print("📚 LOADING LOCAL/HF DATASETS")
+    print("📚 LOADING DATASETS (Auto-download from HuggingFace)")
     print("="*70)
     
-    # Stage 1: MS2 (scientific multi-doc synthesis)
+    # Stage 1: MS2 from MSLR2022 (scientific multi-doc synthesis)
     print("\n📥 Loading MS2 (Stage 1: Scientific Synthesis)...")
-    ms2_train = load_ms2_local(config.data_dir, 'train', max_samples=config.ms2_samples)
-    ms2_val = load_ms2_local(config.data_dir, 'dev', max_samples=1000)
+    ms2_train = load_mslr2022_local(
+        config.data_dir, 
+        split='train', 
+        dataset='ms2', 
+        max_samples=config.ms2_samples,
+        auto_download=True
+    )
+    ms2_val = load_mslr2022_local(
+        config.data_dir, 
+        split='dev', 
+        dataset='ms2', 
+        max_samples=1000,
+        auto_download=True
+    )
     
-    # Stage 2: Layman simplification datasets (UPDATED)
+    # Optional: Cochrane dataset (smaller but cleaner)
+    print("\n📥 Loading Cochrane (optional supplement)...")
+    cochrane_train = load_mslr2022_local(
+        config.data_dir,
+        split='train',
+        dataset='cochrane',
+        max_samples=2000,
+        auto_download=True
+    )
+    
+    # Stage 2: Layman simplification datasets
     print("\n📥 Loading BioLaySumm2025-PLOS (Stage 2: Layman Simplification)...")
-    biolay2025_train = load_biolaysumm2025_plos_local(config.data_dir, 'train', max_samples=config.biolaysumm2025_samples)
-    biolay2025_val = load_biolaysumm2025_plos_local(config.data_dir, 'dev', max_samples=500)
+    biolaysumm_train = load_biolaysumm_2025_local(
+        config.data_dir,
+        split='train',
+        max_samples=config.biolaysumm_samples,
+        auto_download=True
+    )
+    biolaysumm_val = load_biolaysumm_2025_local(
+        config.data_dir,
+        split='dev',
+        max_samples=500,
+        auto_download=True
+    )
     
-    print("\n📥 Loading Med-EASi (cbasu)...")
-    medeasi_train = load_medeasi_cbasu_local(config.data_dir, 'train', max_samples=config.medeasi_samples)
-    
-    # ✅ REMOVED: PLABA loading (repository no longer exists)
-    print("\n⚠️ PLABA: Skipped (https://github.com/xiaoleihuang/PLABA no longer exists)")
+    print("\n📥 Loading Med-EASi...")
+    medeasi_train = load_medeasi_local(
+        config.data_dir,
+        split='train',
+        max_samples=config.medeasi_samples,
+        auto_download=True
+    )
     
     # ============================================================
-    # STAGE 1: SCIENTIFIC SYNTHESIS (MS2)
+    # STAGE 1: SCIENTIFIC SYNTHESIS (MS2 + optional Cochrane)
     # ============================================================
     stage1_output = None
     if ms2_train:
+        # Combine with Cochrane if available
+        train_data = [ms2_train]
+        if cochrane_train:
+            train_data.append(cochrane_train)
+            print(f"   ✅ Combined with {len(cochrane_train)} Cochrane examples")
+        
+        combined_train = concatenate_datasets(train_data).shuffle(seed=config.seed) if len(train_data) > 1 else ms2_train
+        
         stage1_output, model, trainer1 = train_stage(
             model=model,
             tokenizer=tokenizer,
-            train_dataset=ms2_train,
+            train_dataset=combined_train,
             eval_dataset=ms2_val,
             stage_name="Stage1_Scientific",
-            epochs=config.stage1_epochs,  # Reduced to 2 (OpenBioLLM already biomedical)
+            epochs=config.stage1_epochs,
             output_dir=output_dir
         )
         
         generate_training_plots(trainer1, output_dir, timestamp, "Stage1_Scientific")
         
+        # Save checkpoint for Stage 2
         stage1_checkpoint = os.path.join(stage1_output, "stage1_checkpoint")
         os.makedirs(stage1_checkpoint, exist_ok=True)
         model.save_pretrained(stage1_checkpoint)
@@ -955,16 +1083,16 @@ def main():
         print(f"\n📥 Loading Stage 1 checkpoint: {stage1_checkpoint}")
         model = PeftModel.from_pretrained(model.base_model, stage1_checkpoint)
     
-    # Combine layman datasets (NO PLABA)
+    # Combine layman datasets
     layman_datasets = []
-    if biolay2025_train:
-        layman_datasets.append(biolay2025_train)
+    if biolaysumm_train:
+        layman_datasets.append(biolaysumm_train)
     if medeasi_train:
         layman_datasets.append(medeasi_train)
     
     if layman_datasets:
         combined_layman = concatenate_datasets(layman_datasets).shuffle(seed=config.seed)
-        combined_layman_val = biolay2025_val if biolay2025_val else None
+        combined_layman_val = biolaysumm_val if biolaysumm_val else None
         
         stage2_output, model, trainer2 = train_stage(
             model=model,
@@ -978,6 +1106,7 @@ def main():
         
         generate_training_plots(trainer2, output_dir, timestamp, "Stage2_Layman")
         
+        # Save final model
         final_path = os.path.join(output_dir, "final_model")
         os.makedirs(final_path, exist_ok=True)
         model.save_pretrained(final_path)
@@ -1015,7 +1144,7 @@ def main():
     # FINAL SUMMARY
     # ============================================================
     print("\n" + "="*80)
-    print("🏁 OPENBIOLLM-8B SUMMARIZER TRAINING COMPLETE")
+    print("🏁 OpenBioLLM-8B SUMMARIZER TRAINING COMPLETE")
     print("="*80)
     print(f"✅ Final model: {final_path}")
     print(f"✅ Artifacts: {output_dir}")
@@ -1024,10 +1153,6 @@ def main():
     print(f"   from peft import PeftModel")
     print(f"   model = PeftModel.from_pretrained(base_model, '{final_path}')")
     print(f"   summary = generate_summary(model, tokenizer, claim, evidence, register='scientific')")
-    print(f"\n📚 Dataset Notes:")
-    print(f"   • BioLaySumm2025-PLOS: BioLaySumm/BioLaySumm2025-PLOS (HF)")
-    print(f"   • Med-EASi: cbasu/Med-EASi (HF)")
-    print(f"   • PLABA: REMOVED (repository no longer exists)")
     print("="*80)
     
     # Cleanup
