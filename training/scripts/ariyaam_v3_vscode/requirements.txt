@@ -1,0 +1,106 @@
+# ============================================================
+# ARIYAAM v3.0 — Python Dependencies
+# Compatible with Python 3.10+, CUDA 11.8+
+# Optimized for 10-24GB VRAM (QLoRA + xformers)
+# ============================================================
+
+# --- Core ML Framework ---
+# Install PyTorch with CUDA separately first:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+torch>=2.2.0
+# torchvision>=0.17.0  # Not used in NLP pipeline - optional
+# torchaudio>=2.2.0    # Not used in NLP pipeline - optional
+
+# --- Memory-Efficient Attention (Critical for <24GB VRAM) ---
+# xformers must match your PyTorch/CUDA version exactly
+# For PyTorch 2.2.0 + CUDA 11.8: xformers==0.0.23.post1
+xformers>=0.0.23  # Optional but HIGHLY recommended for 10GB VRAM
+
+# --- Transformers & PEFT (LoRA/QLoRA) ---
+transformers>=4.40.0
+datasets>=2.18.0
+peft>=0.10.0
+accelerate>=0.28.0
+trl>=0.8.0
+
+# --- Quantization (QLoRA) ---
+# Windows users: Pre-built wheels may be unavailable. Use WSL2 or Linux if issues occur.
+# Alternative for Windows: pip install bitsandbytes-windows
+bitsandbytes>=0.43.0
+
+# --- NLP & Biomedical Text Processing ---
+sentence-transformers>=2.5.0
+nltk>=3.8.0
+textstat>=0.7.3
+# spacy>=3.7.0          # REMOVED: Not used in v3.8.5 (FIX #1)
+# scispacy>=0.5.0       # REMOVED: Not used in v3.8.5 (FIX #1)
+
+# --- Data Handling ---
+pandas>=2.2.0
+numpy>=1.26.0
+pyarrow>=15.0.0  # Faster dataset loading
+jsonlines>=4.0.0  # Native .jsonl support for SciFact
+protobuf>=4.25.0  # Required for some HF dataset loading
+
+# --- Evaluation Metrics ---
+scikit-learn>=1.4.0
+scipy>=1.10.0  # For Spearman/Pearson correlation in G-Eval
+rouge-score>=0.1.2
+bert-score>=0.3.13
+# sari>=0.0.1  # Unmaintained - use alternative below if needed:
+# pip install git+https://github.com/pipitonejs/sari.git
+sacrebleu>=2.4.0  # More reliable for text generation metrics
+
+# --- LLM Integration (for 03_llama_summ.py) ---
+# vllm>=0.3.0  # Optional: Fast LLM inference (Linux-only, requires compilation)
+
+# --- Visualization & Logging ---
+matplotlib>=3.8.0
+seaborn>=0.13.0
+tqdm>=4.66.0
+
+# --- HuggingFace & Utilities ---
+huggingface-hub>=0.22.0
+requests>=2.31.0
+gitpython>=3.1.0
+
+# --- Configuration (Optional but Recommended) ---
+# omegaconf>=2.3.0  # If you want structured config management
+
+# --- Development (Optional) ---
+# pytest>=8.0.0
+# black>=24.0.0
+
+# ============================================================
+# Installation Instructions (UPDATED)
+# ============================================================
+# 1. Create & activate virtual environment:
+#    python -m venv .venv
+#    # Windows:
+#    .venv\Scripts\activate
+#    # Linux/Mac:
+#    source .venv/bin/activate
+#
+# 2. Install PyTorch with CUDA 11.8 FIRST:
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#
+# 3. Install xformers (MUST match PyTorch version):
+#    # For PyTorch 2.2.0 + CUDA 11.8:
+#    pip install xformers==0.0.23.post1 --index-url https://download.pytorch.org/whl/cu118
+#
+# 4. Install remaining dependencies:
+#    pip install -r requirements.txt
+#
+# 5. Windows + bitsandbytes fallback:
+#    # If standard install fails:
+#    pip install bitsandbytes --prefer-binary
+#    # Or use Windows fork:
+#    pip install bitsandbytes-windows
+#    # Or use WSL2 for best compatibility
+#
+# 6. Verify CUDA:
+#    python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f}GB')"
+#
+# 7. Test imports:
+#    python -c "from scipy.stats import spearmanr; from sentence_transformers import SentenceTransformer; print('✅ All imports successful')"
+# ============================================================
