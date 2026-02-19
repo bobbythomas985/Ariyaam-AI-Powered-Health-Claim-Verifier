@@ -1,9 +1,8 @@
 # ============================================================
 # ARIYAAM v3.0 — SELECT-THEN-PREDICT RATIONALE ARCHITECTURE
-# Module: 02_select_predict.py (VS Code Compatible)
+# Module: 02_select_predict.py (VS Code Compatible - LOCAL DATASETS)
 # Target: Faithful NLI with extracted evidence rationales
-# ✅ FIXED: Uses CUSTOM dataset scripts (not HuggingFace Hub)
-# ✅ FIXED: Colab dependencies removed for local execution
+# ✅ FIXED: Uses LOCAL dataset files (no HF load_dataset dependency)
 # ✅ FIXED: Windows multiprocessing guards added
 # ✅ FIXED: All paths are local/relative (no /content/)
 # ✅ IMPLEMENTED: 3-phase training (e-SNLI → ERASER → SciFact)
@@ -18,6 +17,7 @@ import torch
 import datetime
 import warnings
 import json
+import csv
 import multiprocessing as mp
 from pathlib import Path
 from functools import partial
@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 from tqdm import tqdm
-from datasets import Dataset, DatasetDict, Features, Sequence, Value, concatenate_datasets, load_dataset, load_from_disk
+from datasets import Dataset, DatasetDict, Features, Sequence, Value, concatenate_datasets
 from transformers import (
     AutoTokenizer,
     AutoModel,
@@ -68,13 +68,11 @@ class Config:
         self.base_dir = os.getcwd()
         self.output_dir = os.path.join(self.base_dir, "models")
         self.data_dir = os.path.join(self.base_dir, "data")
-        self.datasets_dir = os.path.join(self.base_dir, "datasets")  # Custom dataset scripts
         self.drive_dir = os.path.join(self.base_dir, "drive_backup")
         
         # Create directories
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.data_dir, exist_ok=True)
-        os.makedirs(self.datasets_dir, exist_ok=True)
         os.makedirs(self.drive_dir, exist_ok=True)
         
         # Hardware detection
@@ -119,7 +117,6 @@ class Config:
         print(f"   GPUs: {self.num_gpus}")
         print(f"   Output: {self.output_dir}")
         print(f"   Data: {self.data_dir}")
-        print(f"   Datasets: {self.datasets_dir}")
 
 config = Config()
 
@@ -303,223 +300,336 @@ class SelectThenPredictModel(nn.Module):
         return model
 
 # ============================================================
-# CUSTOM DATASET LOADERS (Using Your Scripts)
+# LOCAL DATASET LOADERS (NO HUGGINGFACE load_dataset)
 # ============================================================
-def load_custom_dataset(script_path, config_name=None, split=None, cache_dir=None):
-    """
-    Load dataset using custom HuggingFace dataset script (not from Hub)
+def load_esnli_local(data_dir, split='train', max_samples=None):
+    """Load e-SNLI from local CSV files (rationale annotations for Phase 1)"""
+    print(f"📚 Loading e-SNLI from local files: {data_dir}")
     
-    Args:
-        script_path: Path to the Python dataset script file (.py)
-        config_name: Configuration name (e.g., "v1.0", "plain_text")
-        split: Split to load (e.g., "train", "validation")
-        cache_dir: Directory to cache the downloaded data
-    """
-    from datasets import load_dataset
+    # e-SNLI file paths (downloaded manually from GitHub)
+    files = {
+        'train': [
+            os.path.join(data_dir, 'esnli_train_1.csv'),
+            os.path.join(data_dir, 'esnli_train_2.csv')
+        ],
+        'validation': [os.path.join(data_dir, 'esnli_dev.csv')],
+        'test': [os.path.join(data_dir, 'esnli_test.csv')]
+    }
     
-    # Get the directory containing the script
-    script_dir = os.path.dirname(os.path.abspath(script_path))
-    
-    # Load using local path
-    dataset = load_dataset(
-        script_dir,  # Pass directory, not file path
-        name=config_name,
-        split=split,
-        cache_dir=cache_dir or os.path.join(config.data_dir, "cache"),
-        trust_remote_code=True
-    )
-    
-    return dataset
-
-def load_esnli_custom(cache_dir=None):
-    """Load e-SNLI using custom script"""
-    try:
-        print("📚 Loading e-SNLI using custom script...")
-        
-        script_path = os.path.join(config.datasets_dir, "esnli", "esnli.py")
-        
-        if not os.path.exists(script_path):
-            print(f"⚠️ e-SNLI script not found at: {script_path}")
-            print("   Please download the esnli.py script to: datasets/esnli/")
-            return None
-        
-        # Load all splits
-        dataset = load_custom_dataset(
-            script_path=script_path,
-            config_name="plain_text",
-            cache_dir=cache_dir
-        )
-        
-        # Sample for faster training (e-SNLI is very large)
-        if 'train' in dataset:
-            train_sample = dataset['train'].select(range(min(50000, len(dataset['train']))))
-        else:
-            train_sample = dataset.select(range(min(50000, len(dataset))))
-        
-        if 'validation' in dataset:
-            val_sample = dataset['validation'].select(range(min(5000, len(dataset['validation']))))
-        else:
-            val_sample = train_sample.select(range(min(5000, len(train_sample))))
-        
-        print(f"✅ Loaded e-SNLI: {len(train_sample)} training, {len(val_sample)} validation")
-        return DatasetDict({
-            'train': train_sample,
-            'validation': val_sample
-        })
-    
-    except Exception as e:
-        print(f"⚠️ Failed to load e-SNLI: {e}")
+    if split not in files:
+        print(f"⚠️ Unknown split: {split}")
         return None
-
-def load_fever_custom(cache_dir=None):
-    """Load FEVER using custom script"""
-    try:
-        print("📚 Loading FEVER using custom script...")
-        
-        script_path = os.path.join(config.datasets_dir, "fever", "fever.py")
-        
-        if not os.path.exists(script_path):
-            print(f"⚠️ FEVER script not found at: {script_path}")
-            print("   Please download the fever.py script to: datasets/fever/")
-            return None
-        
-        # Load v1.0 config
-        dataset = load_custom_dataset(
-            script_path=script_path,
-            config_name="v1.0",
-            cache_dir=cache_dir
-        )
-        
-        # Sample for training
-        if 'train' in dataset:
-            train_sample = dataset['train'].select(range(min(10000, len(dataset['train']))))
-        else:
-            train_sample = dataset.select(range(min(10000, len(dataset))))
-        
-        if 'labelled_dev' in dataset:
-            val_sample = dataset['labelled_dev'].select(range(min(2000, len(dataset['labelled_dev']))))
-        else:
-            val_sample = train_sample.select(range(min(2000, len(train_sample))))
-        
-        print(f"✅ Loaded FEVER: {len(train_sample)} training, {len(val_sample)} validation")
-        return DatasetDict({
-            'train': train_sample,
-            'validation': val_sample
-        })
     
-    except Exception as e:
-        print(f"⚠️ Failed to load FEVER: {e}")
-        return None
-
-def load_scifact_custom(cache_dir=None):
-    """Load SciFact using custom script"""
-    try:
-        print("📚 Loading SciFact using custom script...")
+    data = []
+    for filepath in files[split]:
+        if not os.path.exists(filepath):
+            print(f"⚠️ File not found: {filepath}")
+            continue
         
-        script_path = os.path.join(config.datasets_dir, "scifact", "scifact.py")
-        
-        if not os.path.exists(script_path):
-            print(f"⚠️ SciFact script not found at: {script_path}")
-            print("   Please download the scifact.py script to: datasets/scifact/")
-            return None
-        
-        # Load claims config (not corpus)
-        dataset = load_custom_dataset(
-            script_path=script_path,
-            config_name="claims",
-            cache_dir=cache_dir
-        )
-        
-        # Convert to Select-then-Predict format
-        def convert_format(examples):
-            converted = {
-                'claim': [],
-                'evidence_sentences': [],
-                'rationale_mask': [],
-                'nli_label': [],
-                'num_sentences': []
-            }
-            
-            for claim, evidence_label, evidence_sentences in zip(
-                examples['claim'],
-                examples.get('evidence_label', [''] * len(examples['claim'])),
-                examples.get('evidence_sentences', [[]] * len(examples['claim']))
-            ):
-                # Handle evidence sentences
-                sentences = evidence_sentences if isinstance(evidence_sentences, list) else []
-                if len(sentences) == 0:
-                    sentences = ["No evidence available"]
+        with open(filepath, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Parse e-SNLI format
+                premise = row.get('Sentence1', '')
+                hypothesis = row.get('Sentence2', '')
+                label_str = row.get('gold_label', 'neutral').lower()
                 
-                # Create rationale mask (1 if evidence_label is SUPPORT/REFUTE, else 0)
-                rationale = [1] * min(len(sentences), config.max_sentences) if evidence_label in ['SUPPORT', 'REFUTES'] else [0] * min(len(sentences), config.max_sentences)
-                while len(rationale) < config.max_sentences:
-                    rationale.append(0)
-                
-                # Map NLI labels
-                if evidence_label == 'SUPPORT':
+                # Map labels to NLI format
+                if label_str == 'entailment':
                     nli_label = 0
-                elif evidence_label == 'REFUTES':
+                elif label_str == 'contradiction':
                     nli_label = 1
                 else:
                     nli_label = 2
                 
-                converted['claim'].append(claim)
-                converted['evidence_sentences'].append(sentences[:config.max_sentences])
-                converted['rationale_mask'].append(rationale)
-                converted['nli_label'].append(nli_label)
-                converted['num_sentences'].append(len(sentences))
-            
-            return converted
-        
-        if 'train' in dataset:
-            train_converted = dataset['train'].map(convert_format, batched=True, batch_size=100)
-            val_split = dataset.get('validation', dataset['train'].select(range(min(500, len(dataset['train'])))))
-            val_converted = val_split.map(convert_format, batched=True, batch_size=100)
-        else:
-            # Single split dataset
-            converted = dataset.map(convert_format, batched=True, batch_size=100)
-            train_converted = converted.select(range(int(len(converted) * 0.8)))
-            val_converted = converted.select(range(int(len(converted) * 0.8), len(converted)))
-        
-        print(f"✅ Loaded SciFact: {len(train_converted)} training, {len(val_converted)} validation")
-        return DatasetDict({
-            'train': train_converted,
-            'validation': val_converted
-        })
+                # Parse rationale: e-SNLI has highlighted words in explanations
+                # For sentence-level rationale, we'll use a simple heuristic:
+                # Mark sentences containing explanation keywords as rationale
+                explanation = row.get('Explanation_1', '')
+                
+                # Split premise into sentences (simple heuristic)
+                sentences = [s.strip() for s in premise.replace('.', '.\n').split('\n') if s.strip()]
+                if len(sentences) == 0:
+                    sentences = [premise]
+                
+                # Create rationale mask: mark sentences that appear in explanation
+                rationale_mask = []
+                for sent in sentences[:config.max_sentences]:
+                    # Simple heuristic: if sentence words appear in explanation, mark as rationale
+                    sent_words = set(sent.lower().split())
+                    exp_words = set(explanation.lower().split())
+                    if sent_words & exp_words:  # Intersection
+                        rationale_mask.append(1)
+                    else:
+                        rationale_mask.append(0)
+                
+                # Pad rationale mask
+                while len(rationale_mask) < config.max_sentences:
+                    rationale_mask.append(0)
+                
+                data.append({
+                    'claim': hypothesis,  # hypothesis = claim
+                    'evidence_sentences': sentences[:config.max_sentences],
+                    'rationale_mask': rationale_mask[:config.max_sentences],
+                    'nli_label': nli_label,
+                    'num_sentences': len(sentences),
+                    'source': 'esnli'
+                })
+                
+                if max_samples and len(data) >= max_samples:
+                    break
     
-    except Exception as e:
-        print(f"⚠️ Failed to load SciFact: {e}")
+    if not data:
+        print(f"⚠️ No e-SNLI data loaded from {data_dir}")
         return None
+    
+    print(f"✅ Loaded {len(data)} e-SNLI {split} examples")
+    return Dataset.from_list(data)
 
-def load_eraser_dataset(cache_dir=None):
-    """Load ERASER MultiRC + FEVER for Phase 2 domain adaptation"""
-    try:
-        print("📚 Loading ERASER datasets for domain adaptation...")
-        
-        # Try loading from HuggingFace Hub first (if available)
-        try:
-            multirc = load_dataset("eraser_multi_rc", cache_dir=cache_dir)
-            print(f"✅ Loaded MultiRC from Hub: {len(multirc['train'])} examples")
-        except:
-            print("⚠️ MultiRC not available from Hub, skipping...")
-            multirc = None
-        
-        datasets = []
-        if multirc:
-            datasets.append(multirc['train'].select(range(min(10000, len(multirc['train'])))))
-        
-        if datasets:
-            combined = concatenate_datasets(datasets).shuffle(seed=42)
-            return DatasetDict({
-                'train': combined,
-                'validation': combined.select(range(min(2000, len(combined))))
-            })
-        
+def load_fever_local(data_dir, split='train', max_samples=None):
+    """Load FEVER from local JSONL files (rationale annotations for Phase 2)"""
+    print(f"📚 Loading FEVER from local files: {data_dir}")
+    
+    # FEVER file paths (downloaded manually from fever.ai)
+    files = {
+        'train': os.path.join(data_dir, 'train.jsonl'),
+        'validation': os.path.join(data_dir, 'shared_task_dev.jsonl'),
+        'test': os.path.join(data_dir, 'shared_task_test_public.jsonl')
+    }
+    
+    filepath = files.get(split)
+    if not filepath or not os.path.exists(filepath):
+        print(f"⚠️ FEVER file not found: {filepath}")
         return None
     
-    except Exception as e:
-        print(f"⚠️ Failed to load ERASER: {e}")
+    data = []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f):
+            try:
+                row = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+            
+            claim = row.get('claim', '')
+            label_str = row.get('label', 'NOT_ENOUGH_INFO').upper()
+            
+            # Map labels
+            if label_str == 'SUPPORTS':
+                nli_label = 0
+            elif label_str == 'REFUTES':
+                nli_label = 1
+            else:
+                nli_label = 2
+            
+            # Parse evidence with rationale annotations
+            evidence_sentences = []
+            rationale_mask = []
+            
+            evidences = row.get('evidence', [])
+            if evidences:
+                for ev_group in evidences:
+                    for ev in ev_group:
+                        # ev format: [annot_id, evidence_id, wiki_url, sent_id]
+                        if len(ev) >= 4:
+                            sent_id = ev[3]
+                            # For FEVER, we don't have the actual sentence text in the JSONL
+                            # We'll use a placeholder - in production, you'd load wiki-pages.zip
+                            evidence_sentences.append(f"[FEVER_EVIDENCE_{sent_id}]")
+                            # Mark as rationale if evidence exists
+                            rationale_mask.append(1)
+            
+            if not evidence_sentences:
+                evidence_sentences = ["[NO_EVIDENCE]"]
+                rationale_mask = [0]
+            
+            # Pad/truncate
+            evidence_sentences = evidence_sentences[:config.max_sentences]
+            rationale_mask = rationale_mask[:config.max_sentences]
+            while len(rationale_mask) < config.max_sentences:
+                rationale_mask.append(0)
+            
+            data.append({
+                'claim': claim,
+                'evidence_sentences': evidence_sentences,
+                'rationale_mask': rationale_mask,
+                'nli_label': nli_label,
+                'num_sentences': len(evidence_sentences),
+                'source': 'fever'
+            })
+            
+            if max_samples and len(data) >= max_samples:
+                break
+    
+    if not data:
+        print(f"⚠️ No FEVER data loaded from {data_dir}")
         return None
+    
+    print(f"✅ Loaded {len(data)} FEVER {split} examples")
+    return Dataset.from_list(data)
+
+def load_scifact_local(data_dir, split='train', max_samples=None):
+    """Load SciFact from local JSONL files with rationale annotations (Phase 3)"""
+    print(f"📚 Loading SciFact from local files: {data_dir}")
+    
+    # SciFact file paths (from your local data directory)
+    files = {
+        'train': os.path.join(data_dir, 'claims_train.jsonl'),
+        'validation': os.path.join(data_dir, 'claims_dev.jsonl'),
+        'test': os.path.join(data_dir, 'claims_test.jsonl')
+    }
+    
+    filepath = files.get(split)
+    if not filepath or not os.path.exists(filepath):
+        print(f"⚠️ SciFact file not found: {filepath}")
+        return None
+    
+    data = []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f):
+            try:
+                row = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+            
+            claim = row.get('claim', '')
+            
+            # For test split, no labels available
+            if split == 'test':
+                nli_label = -1  # Placeholder
+            else:
+                # SciFact labels: SUPPORT, REFUTE, or empty (NEI)
+                evidences = row.get('evidence', {})
+                if not evidences:
+                    nli_label = 2  # NOT_ENOUGH_INFO
+                else:
+                    # Get first evidence label
+                    first_label = None
+                    for doc_id, ev_list in evidences.items():
+                        if isinstance(ev_list, list) and ev_list:
+                            first_label = ev_list[0].get('label', '')
+                            break
+                    if first_label == 'SUPPORT':
+                        nli_label = 0
+                    elif first_label == 'REFUTE':
+                        nli_label = 1
+                    else:
+                        nli_label = 2
+            
+            # Parse evidence with sentence-level rationale annotations
+            evidence_sentences = []
+            rationale_mask = []
+            
+            evidences = row.get('evidence', {})
+            if evidences:
+                for doc_id, ev_list in evidences.items():
+                    if isinstance(ev_list, list):
+                        for ev in ev_list:
+                            sentences = ev.get('sentences', [])
+                            label = ev.get('label', '')
+                            
+                            for sent in sentences:
+                                evidence_sentences.append(str(sent))
+                                # Mark as rationale if labeled as SUPPORT or REFUTE
+                                if label in ['SUPPORT', 'REFUTE']:
+                                    rationale_mask.append(1)
+                                else:
+                                    rationale_mask.append(0)
+            
+            if not evidence_sentences:
+                evidence_sentences = ["[NO_EVIDENCE]"]
+                rationale_mask = [0]
+            
+            # Pad/truncate to max_sentences
+            evidence_sentences = evidence_sentences[:config.max_sentences]
+            rationale_mask = rationale_mask[:config.max_sentences]
+            while len(rationale_mask) < config.max_sentences:
+                rationale_mask.append(0)
+            
+            data.append({
+                'claim': claim,
+                'evidence_sentences': evidence_sentences,
+                'rationale_mask': rationale_mask,
+                'nli_label': nli_label,
+                'num_sentences': len(evidence_sentences),
+                'source': 'scifact',
+                'claim_id': str(row.get('id', line_num))
+            })
+            
+            if max_samples and len(data) >= max_samples:
+                break
+    
+    if not data:
+        print(f"⚠️ No SciFact data loaded from {data_dir}")
+        return None
+    
+    print(f"✅ Loaded {len(data)} SciFact {split} examples")
+    return Dataset.from_list(data)
+
+def load_eraser_multirc_local(data_dir, split='train', max_samples=None):
+    """Load ERASER MultiRC from local files (optional Phase 2 supplement)"""
+    print(f"📚 Loading ERASER MultiRC from local files: {data_dir}")
+    
+    # MultiRC typically has train/dev/test splits in separate files
+    files = {
+        'train': os.path.join(data_dir, 'multirc_train.jsonl'),
+        'validation': os.path.join(data_dir, 'multirc_dev.jsonl'),
+        'test': os.path.join(data_dir, 'multirc_test.jsonl')
+    }
+    
+    filepath = files.get(split)
+    if not filepath or not os.path.exists(filepath):
+        print(f"⚠️ MultiRC file not found: {filepath} (optional - skipping)")
+        return None
+    
+    # MultiRC format is complex; simplified loading for rationale training
+    data = []
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                row = json.loads(line.strip())
+                # Simplified conversion to our format
+                claim = row.get('question', '')
+                evidence = row.get('paragraph', '')
+                label = row.get('label', 0)  # 1=answer, 0=not answer
+                
+                # Convert to NLI-style labels
+                nli_label = 0 if label == 1 else 2  # SUPPORT or NEI
+                
+                # Split evidence into sentences
+                sentences = [s.strip() for s in evidence.split('.') if s.strip()]
+                sentences = [s + '.' for s in sentences]  # Restore periods
+                
+                # Simple rationale: mark sentences containing answer phrases
+                answer = row.get('answer', '')
+                rationale_mask = [1 if answer.lower() in sent.lower() else 0 for sent in sentences]
+                
+                # Pad/truncate
+                sentences = sentences[:config.max_sentences]
+                rationale_mask = rationale_mask[:config.max_sentences]
+                while len(rationale_mask) < config.max_sentences:
+                    rationale_mask.append(0)
+                
+                data.append({
+                    'claim': claim,
+                    'evidence_sentences': sentences,
+                    'rationale_mask': rationale_mask,
+                    'nli_label': nli_label,
+                    'num_sentences': len(sentences),
+                    'source': 'multirc'
+                })
+                
+                if max_samples and len(data) >= max_samples:
+                    break
+    except Exception as e:
+        print(f"⚠️ Error loading MultiRC: {e}")
+        return None
+    
+    if not data:
+        print(f"⚠️ No MultiRC data loaded")
+        return None
+    
+    print(f"✅ Loaded {len(data)} MultiRC {split} examples")
+    return Dataset.from_list(data)
 
 # ============================================================
 # TOKENIZATION FOR SELECT-THEN-PREDICT
@@ -543,9 +653,8 @@ class SelectPredictDataCollator:
         
         for feature in features:
             # Tokenize claim
-            claim_text = feature.get('claim', feature.get('premise', feature.get('claim_text', '')))
             claim_tokens = self.tokenizer(
-                claim_text,
+                feature.get('claim', ''),
                 truncation=True,
                 max_length=self.max_length,
                 padding='max_length'
@@ -554,9 +663,9 @@ class SelectPredictDataCollator:
             batch['claim_mask'].append(claim_tokens['attention_mask'])
             
             # Tokenize evidence sentences
-            evidence_sentences = feature.get('evidence_sentences', feature.get('sentences', []))
+            evidence_sentences = feature.get('evidence_sentences', [])
             if not evidence_sentences:
-                evidence_sentences = [feature.get('premise', '')]
+                evidence_sentences = [""]
             
             evidence_ids = []
             evidence_mask = []
@@ -586,7 +695,7 @@ class SelectPredictDataCollator:
             batch['rationale_labels'].append(rationale)
             
             # NLI labels
-            batch['nli_labels'].append(feature.get('nli_label', feature.get('label', 2)))
+            batch['nli_labels'].append(feature.get('nli_label', 2))
         
         # Convert to tensors
         batch['claim_ids'] = torch.tensor(batch['claim_ids'], dtype=torch.long)
@@ -627,19 +736,14 @@ class SelectPredictTrainer(Trainer):
         loss = outputs['loss']
         
         return (loss, outputs) if return_outputs else loss
-    
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        # Override to handle custom input format
-        return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
 
 # ============================================================
 # EVALUATION METRICS
 # ============================================================
 def compute_select_predict_metrics(eval_pred):
     """Compute NLI F1 + Rationale AUPRC"""
-    # Extract predictions
     if isinstance(eval_pred, tuple):
-        logits, selection_probs, labels = eval_pred
+        logits, labels = eval_pred
     else:
         logits = eval_pred.predictions
         labels = eval_pred.label_ids
@@ -656,41 +760,25 @@ def compute_select_predict_metrics(eval_pred):
         nli_f1_macro = 0.0
         nli_accuracy = 0.0
     
-    # Rationale metrics (if selection_probs available)
-    rationale_auprc = 0.0
-    if isinstance(eval_pred, tuple) and len(eval_pred) > 1:
-        selection_probs = eval_pred[1]
-        # Compute AUPRC for rationale selection
-        try:
-            rationale_auprc = average_precision_score(
-                eval_pred[2] if len(eval_pred) > 2 else labels,
-                selection_probs.mean(axis=1) if len(selection_probs.shape) > 1 else selection_probs
-            )
-        except:
-            rationale_auprc = 0.0
-    
     return {
         'nli_macro_f1': nli_f1_macro,
-        'nli_accuracy': nli_accuracy,
-        'rationale_auprc': rationale_auprc
+        'nli_accuracy': nli_accuracy
     }
 
 # ============================================================
 # TRAINING PHASES
 # ============================================================
-def train_phase_1_pretrain(model, tokenizer, train_dataset, val_dataset, output_dir):
-    """Phase 1: Pre-train Selector on e-SNLI rationale annotations"""
-    print("\n" + "="*80)
-    print("🚀 PHASE 1: SELECTOR PRE-TRAINING (e-SNLI)")
-    print("="*80)
+def train_phase(model, tokenizer, train_dataset, val_dataset, epochs, lr, output_dir, phase_name):
+    """Generic training function for any phase"""
+    print(f"\n🚀 {phase_name}")
     
     training_args = TrainingArguments(
-        output_dir=os.path.join(output_dir, "phase1_pretrain"),
+        output_dir=os.path.join(output_dir, phase_name.lower().replace(' ', '_')),
         per_device_train_batch_size=config.batch_size,
         per_device_eval_batch_size=config.batch_size * 2,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
-        num_train_epochs=config.pretrain_epochs,
-        learning_rate=config.learning_rate,
+        num_train_epochs=epochs,
+        learning_rate=lr,
         weight_decay=config.weight_decay,
         warmup_ratio=config.warmup_ratio,
         lr_scheduler_type=config.lr_scheduler_type,
@@ -709,7 +797,7 @@ def train_phase_1_pretrain(model, tokenizer, train_dataset, val_dataset, output_
         save_total_limit=2,
         report_to="none",
         seed=config.seed,
-        dataloader_num_workers=0,
+        dataloader_num_workers=0,  # Windows-safe
     )
     
     data_collator = SelectPredictDataCollator(tokenizer, config.max_length, config.max_sentences)
@@ -727,170 +815,12 @@ def train_phase_1_pretrain(model, tokenizer, train_dataset, val_dataset, output_
     trainer.train()
     
     # Save checkpoint
-    checkpoint_path = os.path.join(output_dir, "phase1_pretrain", "checkpoint")
+    checkpoint_path = os.path.join(output_dir, phase_name.lower().replace(' ', '_'), "checkpoint")
     trainer.save_model(checkpoint_path)
     tokenizer.save_pretrained(checkpoint_path)
     
-    print(f"✅ Phase 1 complete. Checkpoint saved to: {checkpoint_path}")
-    return checkpoint_path
-
-def train_phase_2_domain_adapt(model, tokenizer, train_dataset, val_dataset, phase1_checkpoint, output_dir):
-    """Phase 2: Fine-tune on ERASER MultiRC + FEVER"""
-    print("\n" + "="*80)
-    print("🚀 PHASE 2: DOMAIN ADAPTATION (ERASER)")
-    print("="*80)
-    
-    # Load from Phase 1 checkpoint
-    model = SelectThenPredictModel.from_pretrained(phase1_checkpoint, num_labels=config.num_labels)
-    
-    training_args = TrainingArguments(
-        output_dir=os.path.join(output_dir, "phase2_domain_adapt"),
-        per_device_train_batch_size=config.batch_size,
-        per_device_eval_batch_size=config.batch_size * 2,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        num_train_epochs=config.domain_adapt_epochs,
-        learning_rate=config.learning_rate * 0.5,  # Lower LR for fine-tuning
-        weight_decay=config.weight_decay,
-        warmup_ratio=config.warmup_ratio,
-        lr_scheduler_type=config.lr_scheduler_type,
-        optim="adamw_torch",
-        max_grad_norm=config.max_grad_norm,
-        fp16=True if config.device == "cuda" else False,
-        gradient_checkpointing=True,
-        evaluation_strategy="steps",
-        eval_steps=150,
-        save_strategy="steps",
-        save_steps=150,
-        logging_steps=50,
-        load_best_model_at_end=True,
-        metric_for_best_model="nli_macro_f1",
-        greater_is_better=True,
-        save_total_limit=2,
-        report_to="none",
-        seed=config.seed,
-        dataloader_num_workers=0,
-    )
-    
-    data_collator = SelectPredictDataCollator(tokenizer, config.max_length, config.max_sentences)
-    
-    trainer = SelectPredictTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=data_collator,
-        compute_metrics=compute_select_predict_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=config.early_stopping_patience)]
-    )
-    
-    trainer.train()
-    
-    # Save checkpoint
-    checkpoint_path = os.path.join(output_dir, "phase2_domain_adapt", "checkpoint")
-    trainer.save_model(checkpoint_path)
-    tokenizer.save_pretrained(checkpoint_path)
-    
-    print(f"✅ Phase 2 complete. Checkpoint saved to: {checkpoint_path}")
-    return checkpoint_path, model
-
-def train_phase_3_finetune(model, tokenizer, train_dataset, val_dataset, phase2_checkpoint, output_dir):
-    """Phase 3: Fine-tune on SciFact rationale annotations (biomedical)"""
-    print("\n" + "="*80)
-    print("🚀 PHASE 3: BIOMEDICAL FINE-TUNING (SciFact)")
-    print("="*80)
-    
-    # Load from Phase 2 checkpoint
-    model = SelectThenPredictModel.from_pretrained(phase2_checkpoint, num_labels=config.num_labels)
-    
-    training_args = TrainingArguments(
-        output_dir=os.path.join(output_dir, "phase3_finetune"),
-        per_device_train_batch_size=config.batch_size,
-        per_device_eval_batch_size=config.batch_size * 2,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        num_train_epochs=config.finetune_epochs,
-        learning_rate=config.learning_rate * 0.3,  # Even lower LR for final fine-tuning
-        weight_decay=config.weight_decay,
-        warmup_ratio=config.warmup_ratio,
-        lr_scheduler_type=config.lr_scheduler_type,
-        optim="adamw_torch",
-        max_grad_norm=config.max_grad_norm,
-        fp16=True if config.device == "cuda" else False,
-        gradient_checkpointing=True,
-        evaluation_strategy="steps",
-        eval_steps=100,
-        save_strategy="steps",
-        save_steps=100,
-        logging_steps=25,
-        load_best_model_at_end=True,
-        metric_for_best_model="nli_macro_f1",
-        greater_is_better=True,
-        save_total_limit=3,
-        report_to="none",
-        seed=config.seed,
-        dataloader_num_workers=0,
-    )
-    
-    data_collator = SelectPredictDataCollator(tokenizer, config.max_length, config.max_sentences)
-    
-    trainer = SelectPredictTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=data_collator,
-        compute_metrics=compute_select_predict_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=config.early_stopping_patience)]
-    )
-    
-    trainer.train()
-    
-    # Save final model
-    final_path = os.path.join(output_dir, "phase3_finetune", "final")
-    trainer.save_model(final_path)
-    tokenizer.save_pretrained(final_path)
-    
-    print(f"✅ Phase 3 complete. Final model saved to: {final_path}")
-    return final_path, model, trainer
-
-# ============================================================
-# VISUALIZATION
-# ============================================================
-def generate_training_plots(trainer, output_dir, timestamp):
-    """Generate diagnostic plots for Select-then-Predict training"""
-    figures_dir = os.path.join(output_dir, f"select_predict_{timestamp}", "figures")
-    os.makedirs(figures_dir, exist_ok=True)
-    
-    # Training History
-    history = trainer.state.log_history
-    steps = [h["step"] for h in history if "loss" in h]
-    train_loss = [h["loss"] for h in history if "loss" in h]
-    eval_steps = [h["step"] for h in history if "nli_macro_f1" in h]
-    eval_f1 = [h["nli_macro_f1"] for h in history if "nli_macro_f1" in h]
-    
-    plt.figure(figsize=(14, 5))
-    plt.subplot(1, 2, 1)
-    plt.plot(steps, train_loss, label="Train Loss", color="#2E86AB", linewidth=2)
-    plt.xlabel("Training Steps", fontsize=11)
-    plt.ylabel("Loss", fontsize=11)
-    plt.title("Training Loss", fontsize=13, fontweight='bold')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    plt.subplot(1, 2, 2)
-    if eval_steps and eval_f1:
-        plt.plot(eval_steps, eval_f1, label="Val NLI F1", color="#F18F01", marker='s', linewidth=2, markersize=4)
-        plt.axhline(y=config.target_nli_f1, color='r', linestyle='--', label=f'Target ({config.target_nli_f1})', alpha=0.7)
-    plt.xlabel("Training Steps", fontsize=11)
-    plt.ylabel("NLI Macro F1", fontsize=11)
-    plt.title("Validation NLI F1 Progression", fontsize=13, fontweight='bold')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(figures_dir, "training_history.png"), dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"✅ Training plots saved to: {figures_dir}")
+    print(f"✅ {phase_name} complete. Checkpoint: {checkpoint_path}")
+    return checkpoint_path, model, trainer
 
 # ============================================================
 # MAIN TRAINING FUNCTION
@@ -898,15 +828,12 @@ def generate_training_plots(trainer, output_dir, timestamp):
 def main():
     """Main training entry point - Windows multiprocessing safe"""
     print("\n" + "="*80)
-    print("🔬 ARIYAAM v3.0 — SELECT-THEN-PREDICT TRAINING (VS CODE COMPATIBLE)")
+    print("🔬 ARIYAAM v3.0 — SELECT-THEN-PREDICT (LOCAL DATASETS)")
     print("="*80)
-    print(f"📁 Base Directory: {config.base_dir}")
-    print(f"📁 Output Directory: {config.output_dir}")
-    print(f"📁 Data Directory: {config.data_dir}")
-    print(f"📁 Datasets Directory: {config.datasets_dir}")
+    print(f"📁 Base: {config.base_dir}")
+    print(f"📁 Data: {config.data_dir}")
+    print(f"📁 Output: {config.output_dir}")
     print(f"🖥️ Device: {config.device}")
-    print(f"🎯 Target NLI F1: {config.target_nli_f1}")
-    print(f"🎯 Target Rationale AUPRC: {config.target_auprc}")
     print("="*80)
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -918,24 +845,35 @@ def main():
     tokenizer.add_special_tokens({'additional_special_tokens': ["[CLAIM]", "[EVIDENCE]"]})
     
     # ============================================================
-    # LOAD DATASETS USING CUSTOM SCRIPTS
+    # LOAD LOCAL DATASETS
     # ============================================================
     print("\n" + "="*70)
-    print("📚 LOADING DATASETS USING CUSTOM SCRIPTS")
+    print("📚 LOADING LOCAL DATASETS")
     print("="*70)
     
-    cache_dir = os.path.join(config.data_dir, "cache")
-    os.makedirs(cache_dir, exist_ok=True)
+    # Define local data paths based on your tree structure
+    esnli_dir = os.path.join(config.data_dir, "esnli")  # You'll need to create this
+    fever_dir = os.path.join(config.data_dir, "fever")   # You'll need to create this
+    scifact_dir = os.path.join(config.data_dir, "scifact")  # ✅ Already exists
+    multirc_dir = os.path.join(config.data_dir, "eraser_multirc")  # Optional
     
-    # Phase 1: e-SNLI (custom script)
-    esnli_data = load_esnli_custom(cache_dir=cache_dir)
+    # Phase 1: e-SNLI (pre-training)
+    print("\n📥 Loading e-SNLI...")
+    esnli_train = load_esnli_local(esnli_dir, 'train', max_samples=50000)
+    esnli_val = load_esnli_local(esnli_dir, 'validation', max_samples=5000)
     
-    # Phase 2: ERASER + FEVER (custom script for FEVER)
-    eraser_data = load_eraser_dataset(cache_dir=cache_dir)
-    fever_data = load_fever_custom(cache_dir=cache_dir)
+    # Phase 2: FEVER + MultiRC (domain adaptation)
+    print("\n📥 Loading FEVER...")
+    fever_train = load_fever_local(fever_dir, 'train', max_samples=10000)
+    fever_val = load_fever_local(fever_dir, 'validation', max_samples=2000)
     
-    # Phase 3: SciFact (custom script)
-    scifact_data = load_scifact_custom(cache_dir=cache_dir)
+    print("\n📥 Loading MultiRC (optional)...")
+    multirc_train = load_eraser_multirc_local(multirc_dir, 'train', max_samples=5000)
+    
+    # Phase 3: SciFact (biomedical fine-tuning) - ✅ Your data exists here
+    print("\n📥 Loading SciFact...")
+    scifact_train = load_scifact_local(scifact_dir, 'train')
+    scifact_val = load_scifact_local(scifact_dir, 'validation')
     
     # ============================================================
     # INITIALIZE MODEL
@@ -951,120 +889,120 @@ def main():
     )
     model.to(config.device)
     
-    print(f"✅ Model initialized with {sum(p.numel() for p in model.parameters())/1e6:.1f}M parameters")
+    print(f"✅ Model: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
     
     # ============================================================
     # TRAINING PHASES
     # ============================================================
-    phase1_checkpoint = None
-    phase2_checkpoint = None
+    checkpoint_path = None
     
-    # Phase 1: Pre-training (e-SNLI)
-    if esnli_data:
-        phase1_checkpoint = train_phase_1_pretrain(
+    # Phase 1: e-SNLI pre-training (if data available)
+    if esnli_train and esnli_val:
+        checkpoint_path, model, _ = train_phase(
             model, tokenizer,
-            esnli_data['train'],
-            esnli_data['validation'],
-            output_dir
+            esnli_train, esnli_val,
+            epochs=config.pretrain_epochs,
+            lr=config.learning_rate,
+            output_dir=output_dir,
+            phase_name="Phase 1: e-SNLI Pre-training"
         )
     else:
-        print("⚠️ Skipping Phase 1 (e-SNLI not available)")
-        # Save initial model as checkpoint
-        phase1_checkpoint = os.path.join(output_dir, "phase1_pretrain", "checkpoint")
-        os.makedirs(phase1_checkpoint, exist_ok=True)
-        model.save_pretrained(phase1_checkpoint)
-        tokenizer.save_pretrained(phase1_checkpoint)
+        print("⚠️ Skipping Phase 1 (e-SNLI not found)")
+        # Save initial model as starting point
+        checkpoint_path = os.path.join(output_dir, "phase1_init")
+        os.makedirs(checkpoint_path, exist_ok=True)
+        model.save_pretrained(checkpoint_path)
+        tokenizer.save_pretrained(checkpoint_path)
     
-    # Phase 2: Domain Adaptation (ERASER + FEVER)
-    phase2_datasets = []
-    if eraser_data:
-        phase2_datasets.append(eraser_data['train'])
-    if fever_data:
-        phase2_datasets.append(fever_data['train'])
-    
-    if phase2_datasets:
-        combined_train = concatenate_datasets(phase2_datasets).shuffle(seed=42)
-        combined_val = combined_train.select(range(min(2000, len(combined_train))))
+    # Phase 2: Domain adaptation (FEVER + MultiRC)
+    if (fever_train or multirc_train) and checkpoint_path:
+        # Combine FEVER and MultiRC if both available
+        train_data = []
+        if fever_train:
+            train_data.append(fever_train)
+        if multirc_train:
+            train_data.append(multirc_train)
         
-        phase2_checkpoint, model = train_phase_2_domain_adapt(
-            model, tokenizer,
-            combined_train,
-            combined_val,
-            phase1_checkpoint,
-            output_dir
-        )
+        if train_data:
+            combined_train = concatenate_datasets(train_data).shuffle(seed=42)
+            combined_val = fever_val if fever_val else multirc_train.select(range(min(1000, len(multirc_train))))
+            
+            # Load model from Phase 1 checkpoint
+            model = SelectThenPredictModel.from_pretrained(checkpoint_path, num_labels=config.num_labels)
+            
+            checkpoint_path, model, _ = train_phase(
+                model, tokenizer,
+                combined_train, combined_val,
+                epochs=config.domain_adapt_epochs,
+                lr=config.learning_rate * 0.5,
+                output_dir=output_dir,
+                phase_name="Phase 2: Domain Adaptation"
+            )
+        else:
+            print("⚠️ Skipping Phase 2 (no FEVER/MultiRC data)")
     else:
-        print("⚠️ Skipping Phase 2 (ERASER/FEVER not available)")
-        phase2_checkpoint = phase1_checkpoint
+        print("⚠️ Skipping Phase 2 (no checkpoint or data)")
     
-    # Phase 3: Biomedical Fine-tuning (SciFact)
-    if scifact_data:
-        final_path, model, trainer = train_phase_3_finetune(
-            model, tokenizer,
-            scifact_data['train'],
-            scifact_data['validation'],
-            phase2_checkpoint,
-            output_dir
-        )
+    # Phase 3: SciFact fine-tuning (biomedical target domain) - MOST IMPORTANT
+    if scifact_train and scifact_val and checkpoint_path:
+        print("\n" + "="*70)
+        print("🎯 PHASE 3: BIOMEDICAL FINE-TUNING (SciFact)")
+        print("="*70)
         
-        # Generate plots
-        generate_training_plots(trainer, output_dir, timestamp)
+        # Load from previous checkpoint
+        model = SelectThenPredictModel.from_pretrained(checkpoint_path, num_labels=config.num_labels)
+        
+        final_path, model, trainer = train_phase(
+            model, tokenizer,
+            scifact_train, scifact_val,
+            epochs=config.finetune_epochs,
+            lr=config.learning_rate * 0.3,
+            output_dir=output_dir,
+            phase_name="Phase 3: SciFact Fine-tuning"
+        )
         
         # Final evaluation
-        print("\n" + "="*80)
-        print("📊 FINAL EVALUATION")
-        print("="*80)
-        
+        print("\n📊 FINAL EVALUATION")
         eval_results = trainer.evaluate()
-        print(f"Final NLI Macro F1: {eval_results.get('eval_nli_macro_f1', 0):.4f}")
-        print(f"Final Rationale AUPRC: {eval_results.get('eval_rationale_auprc', 0):.4f}")
+        print(f"   NLI Macro F1: {eval_results.get('eval_nli_macro_f1', 0):.4f}")
         
         # Save metrics
         metrics = {
             'final_nli_f1': eval_results.get('eval_nli_macro_f1', 0),
-            'final_rationale_auprc': eval_results.get('eval_rationale_auprc', 0),
             'timestamp': timestamp,
             'model': config.model_name,
             'phases_completed': 3,
-            'target_nli_f1': config.target_nli_f1,
-            'target_auprc': config.target_auprc
+            'target_nli_f1': config.target_nli_f1
         }
-        
         with open(os.path.join(final_path, "metrics.json"), 'w') as f:
             json.dump(metrics, f, indent=2)
         
-        print(f"✅ Metrics saved to: {os.path.join(final_path, 'metrics.json')}")
+        print(f"✅ Final model: {final_path}")
     else:
-        print("⚠️ Skipping Phase 3 (SciFact not available)")
-        final_path = phase2_checkpoint
+        print("⚠️ Skipping Phase 3 (SciFact not available or no checkpoint)")
+        final_path = checkpoint_path
     
     # ============================================================
     # FINAL SUMMARY
     # ============================================================
     print("\n" + "="*80)
-    print("🏁 SELECT-THEN-PREDICT TRAINING COMPLETED")
+    print("🏁 TRAINING COMPLETE")
     print("="*80)
-    print(f"✅ Final model saved to: {final_path}")
-    print(f"✅ Training artifacts saved to: {output_dir}")
-    print(f"✅ Backup saved to: {config.drive_dir}")
+    if final_path:
+        print(f"✅ Model saved: {final_path}")
+    print(f"✅ Artifacts: {output_dir}")
+    print(f"✅ Backup: {config.drive_dir}")
     print("="*80)
     
     # Cleanup
-    print("\n🧹 Cleaning up memory...")
-    import gc
     if config.device == "cuda":
         torch.cuda.empty_cache()
+    import gc
     gc.collect()
-    print("✅ Memory cleaned up successfully!")
-    
-    print("\n" + "="*80)
-    print("🎉 ARIYAAM v3.0 SELECT-THEN-PREDICT TRAINING COMPLETE!")
-    print("="*80)
 
 # ============================================================
-# WINDOWS MULTIPROCESSING GUARD (CRITICAL FOR VS CODE ON WINDOWS)
+# WINDOWS MULTIPROCESSING GUARD
 # ============================================================
 if __name__ == "__main__":
-    # Required for Windows multiprocessing compatibility
     mp.set_start_method('spawn', force=True)
     main()
